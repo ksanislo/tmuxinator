@@ -220,9 +220,18 @@ class TmuxHandlers:
                                              char_w, char_h, sb_w, tb_h,
                                              handle_size, vpad_x, vpad_y)
                             for c in node.children[1:])
-                        # Add handles between right-side children (nested Paneds)
+                        # Add separators between right-side children
                         if len(node.children) > 2:
-                            right_px += (len(node.children) - 2) * handle_size
+                            sep = char_w if orient == 'h' else char_h
+                            right_px += (len(node.children) - 2) * sep
+
+                        # Pad the first child so the visual gap
+                        # (padding + handle) = 1 character cell.
+                        # The handle may be smaller than a full char,
+                        # so add the difference as dead space.
+                        char_sep = char_w if orient == 'h' else char_h
+                        if char_sep > handle_size:
+                            left_px += char_sep - handle_size
 
                         total_px = left_px + right_px
                         if total_px > 0:
@@ -262,12 +271,17 @@ class TmuxHandlers:
                 return node.height * char_h + vte_pad_y + tb_h
 
         if node.orientation == orientation:
-            # Same direction: sum children + internal Paned handles
+            # Same direction: sum children + separators.
+            # For v-splits, use char_h as separator size (not handle_size)
+            # so the total matches tmux's 1-char-tall separators. The
+            # extra pixels (char_h - handle_size) become padding in
+            # _apply_ratios to visually merge with the handle.
             child_px = [self._subtree_px(c, orientation,
                                          char_w, char_h, sb_w, tb_h,
                                          handle_size, vte_pad_x, vte_pad_y)
                         for c in node.children]
-            return sum(child_px) + (len(child_px) - 1) * handle_size
+            sep = char_w if orientation == 'h' else char_h
+            return sum(child_px) + (len(child_px) - 1) * sep
         else:
             # Cross direction: take max — a v-split child needs more
             # pixels than a leaf for the same character count (extra

@@ -511,6 +511,8 @@ class Paned(Container):
 
 class HPaned(Paned, Gtk.HPaned):
     """Merge Gtk.HPaned into our base Paned Container"""
+    _char_snap = 0  # set from terminal.py set_font
+
     def __init__(self):
         """Class initialiser"""
         Paned.__init__(self)
@@ -519,6 +521,38 @@ class HPaned(Paned, Gtk.HPaned):
         self.register_signals(HPaned)
         self.cnxids.new(self, 'button-press-event', self.on_button_press)
         self.cnxids.new(self, 'button-release-event', self.on_button_release)
+        self._snapping = False
+        self.connect('notify::position', self._snap_position)
+
+    _measured_gap = None  # actual pixel gap, measured after first layout
+
+    def _snap_position(self, widget, pspec):
+        """Snap handle so child2 starts at a character cell boundary."""
+        snap = HPaned._char_snap
+        if self._snapping or snap <= 0:
+            return
+        pos = self.get_position()
+        gap = self._measured_gap if self._measured_gap else self.get_handlesize()
+        n = round((pos + gap) / snap)
+        snapped = max(n * snap - gap, 0)
+        if snapped != pos:
+            self._snapping = True
+            self.set_pos(snapped)
+            self._snapping = False
+        if self._measured_gap is None:
+            from gi.repository import GLib
+            def _measure():
+                c1 = self.get_child1()
+                c2 = self.get_child2()
+                if c1 and c2:
+                    a1 = c1.get_allocation()
+                    a2 = c2.get_allocation()
+                    actual = a2.x - (a1.x + a1.width)
+                    if actual > 0:
+                        self._measured_gap = actual
+                        self._snap_position(self, None)
+                return False
+            GLib.idle_add(_measure)
 
     def get_length(self):
         return(self.get_allocated_width())
@@ -529,6 +563,8 @@ class HPaned(Paned, Gtk.HPaned):
 
 class VPaned(Paned, Gtk.VPaned):
     """Merge Gtk.VPaned into our base Paned Container"""
+    _char_snap = 0  # set from terminal.py set_font
+
     def __init__(self):
         """Class initialiser"""
         Paned.__init__(self)
@@ -537,6 +573,41 @@ class VPaned(Paned, Gtk.VPaned):
         self.register_signals(VPaned)
         self.cnxids.new(self, 'button-press-event', self.on_button_press)
         self.cnxids.new(self, 'button-release-event', self.on_button_release)
+        self._snapping = False
+        self.connect('notify::position', self._snap_position)
+
+    _measured_gap = None  # actual pixel gap, measured after first layout
+
+    def _snap_position(self, widget, pspec):
+        """Snap handle so child2 starts at a character cell boundary."""
+        snap = VPaned._char_snap
+        if self._snapping or snap <= 0:
+            return
+        pos = self.get_position()
+        # Use measured gap if available, otherwise fall back to handle-size
+        gap = self._measured_gap if self._measured_gap else self.get_handlesize()
+        n = round((pos + gap) / snap)
+        snapped = max(n * snap - gap, 0)
+        if snapped != pos:
+            self._snapping = True
+            self.set_pos(snapped)
+            self._snapping = False
+        # Measure actual gap after layout settles (once)
+        if self._measured_gap is None:
+            from gi.repository import GLib
+            def _measure():
+                c1 = self.get_child1()
+                c2 = self.get_child2()
+                if c1 and c2:
+                    a1 = c1.get_allocation()
+                    a2 = c2.get_allocation()
+                    actual = a2.y - (a1.y + a1.height)
+                    if actual > 0:
+                        self._measured_gap = actual
+                        # Re-snap with correct gap
+                        self._snap_position(self, None)
+                return False
+            GLib.idle_add(_measure)
 
     def get_length(self):
         return(self.get_allocated_height())

@@ -1977,6 +1977,10 @@ class Terminal(Gtk.VBox):
                 # Use the larger dimension for handle-size (GTK only
                 # supports one value) and use CSS min-width/min-height
                 # on separators for per-direction sizing.
+                # Set snap values for paned position snapping
+                from .paned import HPaned, VPaned
+                HPaned._char_snap = char_w
+                VPaned._char_snap = char_h
                 css = (
                     'paned {{'
                     '  -GtkPaned-handle-size: {w};'
