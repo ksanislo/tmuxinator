@@ -120,20 +120,60 @@ class TmuxHandlers:
 
     def _update_pane_sizes(self, tree):
         """Update split ratios to match tmux's pane dimensions.
-        Called on GTK thread."""
+        Called on GTK thread.
+
+        If tmux's root dimensions differ from our current window size,
+        resize the GTK window first and defer ratio application to the
+        next GTK cycle so the window has its new allocation.
+        """
         import time
         self.controller._applying_layout = True
+        deferred = False
         try:
             self._record_tmux_sizes(tree)
-            if not tree.is_leaf:
+            resize = self.controller._calculate_window_resize_pixels(
+                tree.width, tree.height)
+            if resize is not None:
+                w_px, h_px = resize
+                terminals = list(self.controller.terminal_to_pane.keys())
+                if terminals:
+                    window = terminals[0].get_toplevel()
+                    tmux_dbg('resizing window to %dx%d px for tmux %dx%d' % (
+                        w_px, h_px, tree.width, tree.height))
+                    window.resize(w_px, h_px)
+                    if not tree.is_leaf:
+                        GLib.idle_add(self._apply_ratios_and_finish, tree)
+                        deferred = True
+            if not deferred and not tree.is_leaf:
                 self._apply_ratios(tree)
+        finally:
+            if not deferred:
+                self.controller._applying_layout = False
+                self.controller._layout_applied_time = time.monotonic()
+        return False
+
+    def _apply_ratios_and_finish(self, tree):
+        """Deferred callback to apply ratios after a window resize.
+
+        _applying_layout stays True across the window resize AND this
+        deferred ratio application, providing continuous suppression
+        of resize echo-back.
+        """
+        import time
+        try:
+            self._apply_ratios(tree)
         finally:
             self.controller._applying_layout = False
             self.controller._layout_applied_time = time.monotonic()
         return False
 
     def _record_tmux_sizes(self, node):
-        """Record tmux's reported pane sizes to prevent resize feedback loops."""
+        """Record tmux's reported pane sizes to prevent resize feedback loops.
+
+        Only updates _last_pane_sizes (tmux's view). Does NOT touch
+        _prev_vte_sizes — those track actual VTE widget sizes and are
+        only updated from real VTE measurements in do_resize.
+        """
         if node.is_leaf:
             self.controller._last_pane_sizes[node.pane_id] = (node.width, node.height)
         else:
