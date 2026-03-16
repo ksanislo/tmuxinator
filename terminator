@@ -128,13 +128,32 @@ if __name__ == '__main__':
         TERMINATOR.set_dbus_data(dbus_service)
         TERMINATOR.reconfigure()
 
-        try:
-            dbg('Creating a terminal with layout: %s' % OPTIONS.layout)
-            TERMINATOR.create_layout(OPTIONS.layout)
-        except (KeyError,ValueError) as ex:
-            err('layout creation failed, creating a window ("%s")' % ex)
-            TERMINATOR.new_window()
+        tmux_session = getattr(OPTIONS, 'tmux_attach', None) or getattr(OPTIONS, 'tmux_new', None)
+        if tmux_session:
+            from terminatorlib.tmux.controller import TmuxController
+            new_session = bool(getattr(OPTIONS, 'tmux_new', None))
+            tmux_ctrl = TmuxController()
+            tmux_ctrl.start(tmux_session, new_session=new_session)
+            tmux_layout = tmux_ctrl.get_initial_layout()
+            if tmux_layout:
+                dbg('Using tmux layout: %s' % tmux_layout)
+                TERMINATOR.create_layout_from_flat(tmux_layout)
+            else:
+                err('tmux layout not available, falling back to default')
+                TERMINATOR.new_window()
+        else:
+            try:
+                dbg('Creating a terminal with layout: %s' % OPTIONS.layout)
+                TERMINATOR.create_layout(OPTIONS.layout)
+            except (KeyError,ValueError) as ex:
+                err('layout creation failed, creating a window ("%s")' % ex)
+                TERMINATOR.new_window()
+
         TERMINATOR.layout_done()
+
+        # After layout_done, terminals are registered - capture initial content
+        if tmux_session and tmux_ctrl.active:
+            tmux_ctrl.handlers.capture_initial_content()
 
     if OPTIONS.debug and OPTIONS.debug >= 2:
         import terminatorlib.debugserver as debugserver

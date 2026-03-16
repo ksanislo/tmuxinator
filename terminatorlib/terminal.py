@@ -108,6 +108,8 @@ class Terminal(Gtk.VBox):
     directory = None
 
     is_held_open = False
+    tmux_pane_id = None
+    _tmux_closing = False
 
     fgcolor_active = None
     fgcolor_inactive = None
@@ -120,6 +122,30 @@ class Terminal(Gtk.VBox):
 
     cnxids = None
     targets_for_new_group = None
+
+    def emit(self, *args):
+        """Override emit to intercept split/tab signals in tmux mode."""
+        if self.tmux_pane_id is not None and len(args) >= 1:
+            sig = args[0]
+            if sig == 'split-horiz':
+                self.tmux_split(horizontal=True)
+                return
+            elif sig == 'split-vert':
+                self.tmux_split(horizontal=False)
+                return
+            elif sig == 'split-auto':
+                self.tmux_split(horizontal=True)
+                return
+            elif sig == 'tab-new':
+                self.tmux_new_window()
+                return
+        GObject.GObject.emit(self, *args)
+
+    def tmux_new_window(self):
+        """Request a new tmux window. The %window-add handler will create the tab."""
+        from terminatorlib.tmux.controller import TmuxController
+        ctrl = TmuxController()
+        ctrl.protocol.send_command('new-window')
 
     def __init__(self):
         """Class initialiser"""
@@ -270,7 +296,16 @@ class Terminal(Gtk.VBox):
         dbg('close: called')
         self.cnxids.remove_widget(self.vte)
         self.emit('close-term')
-        if self.pid is not None:
+        if self.tmux_pane_id is not None:
+            from terminatorlib.tmux.controller import TmuxController
+            ctrl = TmuxController()
+            pane_id = self.tmux_pane_id
+            ctrl.unregister_terminal(self)
+            # If this close was initiated from Terminator (not from tmux),
+            # kill the tmux pane too
+            if not self._tmux_closing and ctrl.active:
+                ctrl.protocol.send_command('kill-pane -t {}'.format(pane_id))
+        elif self.pid is not None:
             try:
                 dbg('close: killing %d' % self.pid)
                 os.kill(self.pid, signal.SIGHUP)
@@ -484,6 +519,98 @@ class Terminal(Gtk.VBox):
             self.on_vte_notify_enter)
 
         self.cnxids.new(self.vte, 'realize', self.reconfigure)
+
+        # Watch for tmux control mode output
+        self._tmux_detect_id = self.vte.connect('contents-changed',
+            self.on_vte_contents_changed_tmux_detect)
+
+    def on_vte_contents_changed_tmux_detect(self, widget):
+        """Detect tmux -CC control mode output in terminal text."""
+        if self.tmux_pane_id is not None:
+            return
+        # Get last few rows of terminal text to look for control mode markers
+        col, row = self.vte.get_cursor_position()
+        if row < 1:
+            return
+        start_row = max(0, row - 10)
+        ncols = self.vte.get_column_count()
+        text = None
+        try:
+            text = self.vte.get_text_range_format(
+                Vte.Format.TEXT, start_row, 0, row, ncols)
+            if isinstance(text, tuple):
+                text = text[0]
+        except Exception:
+            pass
+        if not text or not text.strip():
+            return
+        if '%begin' in text and ('%session-changed' in text
+                                 or '%end' in text):
+            dbg('Detected tmux control mode output, taking over PTY')
+            # Disconnect this handler so we don't fire again
+            if self._tmux_detect_id:
+                self.vte.disconnect(self._tmux_detect_id)
+                self._tmux_detect_id = None
+            GLib.idle_add(self._takeover_tmux_pty)
+
+    def _takeover_tmux_pty(self):
+        """Take over the PTY from VTE for tmux control mode.
+
+        Swaps VTE to a dummy PTY (set_pty(None) segfaults), then uses
+        the original PTY fd to communicate with the tmux -C process.
+        """
+        import os
+        from terminatorlib.tmux.controller import TmuxController
+
+        ctrl = TmuxController()
+        if ctrl.active:
+            dbg('_takeover_tmux_pty: controller already active, skipping')
+            return False
+
+        pty = self.vte.get_pty()
+        if not pty:
+            dbg('_takeover_tmux_pty: no PTY available')
+            return False
+
+        # Dup the fd so we own it independently
+        orig_fd = pty.get_fd()
+        our_fd = os.dup(orig_fd)
+        dbg('_takeover_tmux_pty: duped fd %d -> %d' % (orig_fd, our_fd))
+
+        # Swap VTE to a dummy PTY so it stops reading the original fd.
+        # (set_pty(None) segfaults when a child is active)
+        dummy_pty = Vte.Pty.new_sync(Vte.PtyFlags.DEFAULT)
+        self._saved_pty = pty  # prevent GC from closing orig fd
+        self.vte.set_pty(dummy_pty)
+        dbg('_takeover_tmux_pty: swapped VTE to dummy PTY')
+
+        # Start the controller in a thread (it blocks waiting for layout)
+        import threading
+        def start_tmux():
+            ctrl.start_from_pty(our_fd)
+            tmux_layout = ctrl.get_initial_layout()
+            if tmux_layout:
+                GLib.idle_add(self._create_tmux_window, ctrl, tmux_layout)
+            else:
+                dbg('_takeover_tmux_pty: no layout from tmux')
+        t = threading.Thread(target=start_tmux, daemon=True)
+        t.start()
+        return False
+
+    def _create_tmux_window(self, ctrl, tmux_layout):
+        """Create a new Terminator window with tmux layout."""
+        from terminatorlib.terminator import Terminator
+        term = Terminator()
+        dbg('_create_tmux_window: creating window with tmux layout')
+        try:
+            term.create_layout_from_flat(tmux_layout)
+            term.layout_done()
+            ctrl.handlers.capture_initial_content()
+        except Exception as e:
+            dbg('_create_tmux_window: error: %s' % e)
+            import traceback
+            traceback.print_exc()
+        return False
 
     def create_popup_group_menu(self, widget, event = None):
         """Pop up a menu for the group widget"""
@@ -982,6 +1109,11 @@ class Terminal(Gtk.VBox):
                 getattr(self, "key_" + mapping)()
                 return True
 
+        if self.tmux_pane_id is not None:
+            from terminatorlib.tmux.controller import TmuxController
+            TmuxController().send_keypress(self, event)
+            return True
+
         # FIXME: This is all clearly wrong. We should be doing this better
         #         maybe we can emit the key event and let Terminator() care?
         groupsend = self.terminator.groupsend
@@ -1437,6 +1569,10 @@ class Terminal(Gtk.VBox):
         else:
             window = self.get_toplevel()
             window.disable_geometry_hints()
+        if self.tmux_pane_id is not None:
+            from terminatorlib.tmux.controller import TmuxController
+            TmuxController().notify_resize(self,
+                self.vte.get_column_count(), self.vte.get_row_count())
 
     def on_vte_notify_enter(self, term, event):
         """Handle the mouse entering this terminal"""
@@ -1521,6 +1657,10 @@ class Terminal(Gtk.VBox):
         self.titlebar.update()
 
     def spawn_child(self, widget=None, respawn=False, debugserver=False, init_command=None):
+        if self.tmux_pane_id is not None:
+            dbg('spawn_child: tmux mode, skipping local shell spawn')
+            return
+
         args = []
         shell = None
         command = init_command
@@ -1706,15 +1846,31 @@ class Terminal(Gtk.VBox):
     def paste_clipboard(self, primary=False, mouse=False):
         """Paste one of the two clipboards"""
         if not (mouse and self.config['disable_mouse_paste']):
-            for term in self.terminator.get_target_terms(self):
+            if self.tmux_pane_id is not None:
+                from terminatorlib.tmux.controller import TmuxController
                 if primary:
-                    term.vte.paste_primary()
+                    clip = Gtk.Clipboard.get(Gdk.SELECTION_PRIMARY)
                 else:
-                    term.vte.paste_clipboard()
+                    clip = self.clipboard
+                text = clip.wait_for_text()
+                if text:
+                    TmuxController().send_paste(self, text)
+            else:
+                for term in self.terminator.get_target_terms(self):
+                    if primary:
+                        term.vte.paste_primary()
+                    else:
+                        term.vte.paste_clipboard()
             self.vte.grab_focus()
 
     def feed(self, text):
         """Feed the supplied text to VTE"""
+        if self.tmux_pane_id is not None:
+            from terminatorlib.tmux.controller import TmuxController
+            if isinstance(text, bytes):
+                text = text.decode('utf-8', errors='replace')
+            TmuxController().send_paste(self, text)
+            return
         # Ensure text is bytes for feed_child
         if isinstance(text, str):
             text = text.encode()
@@ -1849,6 +2005,13 @@ class Terminal(Gtk.VBox):
             self.directory = layout['directory']
         if 'uuid' in layout and layout['uuid'] != '':
             self.uuid = make_uuid(layout['uuid'])
+        if 'tmux' in layout and layout['tmux']:
+            tmux = layout['tmux']
+            self.tmux_pane_id = tmux['pane_id']
+            if 'width' in tmux and 'height' in tmux:
+                self.vte.set_size(int(tmux['width']), int(tmux['height']))
+            from terminatorlib.tmux.controller import TmuxController
+            TmuxController().register_terminal(self.tmux_pane_id, self)
 
     def scroll_by_page(self, pages):
         """Scroll up or down in pages"""
@@ -1954,6 +2117,16 @@ class Terminal(Gtk.VBox):
 
     def key_split_vert(self):
         self.emit('split-vert', self.get_cwd())
+
+    def tmux_split(self, horizontal=True):
+        """Request a split via tmux. The %layout-change handler will create the widget."""
+        from terminatorlib.tmux.controller import TmuxController
+        ctrl = TmuxController()
+        pane_id = self.tmux_pane_id
+        # tmux -h = side-by-side, Terminator "horiz" = top/bottom, so invert
+        orientation = '-v' if horizontal else '-h'
+        ctrl.protocol.send_command(
+            'split-window {} -t {}'.format(orientation, pane_id))
 
     def key_rotate_cw(self):
         self.emit('rotate-cw')
@@ -2071,6 +2244,9 @@ class Terminal(Gtk.VBox):
         self.terminator.new_window(self.get_cwd(), self.get_profile())
 
     def key_new_tab(self):
+        if self.tmux_pane_id is not None:
+            self.tmux_new_window()
+            return
         self.get_toplevel().tab_new(self)
 
     def key_new_terminator(self):

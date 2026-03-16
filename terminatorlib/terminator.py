@@ -308,6 +308,66 @@ class Terminator(Borg):
 
         self.layoutname = layoutname
 
+    def create_layout_from_flat(self, flat_layout):
+        """Create layout from a flat dict with 'parent' references.
+
+        Used by tmux integration to build the window layout from tmux state.
+        Reuses the same flat-to-nested conversion as create_layout().
+        """
+        layout = copy.deepcopy(flat_layout)
+        objects = {}
+
+        self.doing_layout = True
+        self.last_active_window = None
+        self.prelayout_windows = self.windows[:]
+
+        # Wind the flat objects into a hierarchy (same logic as create_layout)
+        hierarchy = {}
+        count = 0
+        while len(layout) > 0 and count < 1000:
+            count = count + 1
+            if count == 1000:
+                err('hit maximum loop boundary. THIS IS VERY LIKELY A BUG')
+            for obj in list(layout.keys()):
+                if layout[obj]['type'].lower() == 'window':
+                    hierarchy[obj] = {}
+                    hierarchy[obj]['type'] = 'Window'
+                    hierarchy[obj]['children'] = {}
+                    for objkey in list(layout[obj].keys()):
+                        if layout[obj][objkey] != '' and objkey not in hierarchy[obj]:
+                            hierarchy[obj][objkey] = layout[obj][objkey]
+                    objects[obj] = hierarchy[obj]
+                    del(layout[obj])
+                else:
+                    if 'parent' not in layout[obj]:
+                        err('Invalid object: %s' % obj)
+                        del(layout[obj])
+                        continue
+                    if layout[obj]['parent'] in objects:
+                        childobj = {}
+                        childobj['type'] = layout[obj]['type']
+                        childobj['children'] = {}
+                        for objkey in list(layout[obj].keys()):
+                            if objkey not in childobj:
+                                childobj[objkey] = layout[obj][objkey]
+                        objects[layout[obj]['parent']]['children'][obj] = childobj
+                        objects[obj] = childobj
+                        del(layout[obj])
+
+        layout = hierarchy
+
+        for windef in layout:
+            if layout[windef]['type'] != 'Window':
+                err('invalid layout format. %s' % layout)
+                raise(ValueError)
+            window, terminal = self.new_window()
+            if 'tmux_size' in layout[windef]:
+                size = layout[windef]['tmux_size']
+                window.resize(int(size[0]) * 8, int(size[1]) * 16)
+            window.create_layout(layout[windef])
+
+        self.layoutname = 'tmux'
+
     def layout_done(self):
         """Layout operations have finished, record that fact"""
         self.doing_layout = False
@@ -323,7 +383,7 @@ class Terminator(Borg):
             window_last_active_term_mapping[window] = copy.copy(source.last_active_term)
 
         for terminal in self.terminals:
-            if not terminal.pid:
+            if not terminal.pid and terminal.tmux_pane_id is None:
                 terminal.spawn_child()
 
         for window in self.windows:
