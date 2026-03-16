@@ -279,6 +279,23 @@ class Window(Container, Gtk.Window):
 
     def on_delete_event(self, window, event, data=None):
         """Handle a window close request"""
+        # If this window has tmux terminals, detach instead of closing.
+        # Individual pane/tab closes still kill their tmux panes, but
+        # closing the whole window should preserve the tmux session.
+        terminals = self.get_terminals()
+        if terminals and any(getattr(t, 'tmux_pane_id', None) is not None
+                             for t in terminals):
+            dbg('tmux window close: detaching instead of closing')
+            from .tmux.controller import TmuxController
+            ctrl = TmuxController()
+            if ctrl.active:
+                # Mark all terminals so close() won't kill tmux panes
+                for t in terminals:
+                    if t.tmux_pane_id is not None:
+                        t._tmux_closing = True
+                ctrl.stop()
+            return False  # allow the window to close
+
         maker = Factory()
 
         child = self.get_child()
