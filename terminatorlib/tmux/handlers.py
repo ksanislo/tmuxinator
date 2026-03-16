@@ -6,6 +6,7 @@ All GTK operations are dispatched via GLib.idle_add() for thread safety.
 from gi.repository import GLib
 
 from terminatorlib.util import dbg
+from terminatorlib.tmux import tmux_dbg
 from terminatorlib.tmux.layout import (
     parse_tmux_layout, get_pane_ids, find_pane_parent, find_pane_node,
 )
@@ -92,6 +93,102 @@ class TmuxHandlers:
             GLib.idle_add(self._close_panes, deleted_panes)
         elif added_panes:
             GLib.idle_add(self._add_panes, added_panes, new_tree)
+        else:
+            # Same panes but resized — update our splits to match
+            self._log_layout_sizes(new_tree)
+            GLib.idle_add(self._update_pane_sizes, new_tree)
+
+    def _log_layout_sizes(self, node, depth=0):
+        """Log tmux layout sizes vs actual VTE and Terminal widget sizes."""
+        if node.is_leaf:
+            terminal = self.controller.pane_to_terminal.get(node.pane_id)
+            if terminal:
+                try:
+                    vte_cols = terminal.vte.get_column_count()
+                    vte_rows = terminal.vte.get_row_count()
+                    tw_cols, tw_rows = self.controller._pane_size_for_tmux(terminal)
+                    match = 'OK' if (tw_cols == node.width and tw_rows == node.height) else 'MISMATCH'
+                    tmux_dbg('  %s%s: tmux=%dx%d widget=%dx%d vte=%dx%d %s' % (
+                        '  ' * depth, node.pane_id, node.width, node.height,
+                        tw_cols, tw_rows, vte_cols, vte_rows, match))
+                except Exception:
+                    pass
+        else:
+            tmux_dbg('  %s%s split %dx%d:' % ('  ' * depth, node.orientation, node.width, node.height))
+            for child in node.children:
+                self._log_layout_sizes(child, depth + 1)
+
+    def _update_pane_sizes(self, tree):
+        """Update split ratios to match tmux's pane dimensions.
+        Called on GTK thread."""
+        import time
+        self.controller._applying_layout = True
+        try:
+            self._record_tmux_sizes(tree)
+            if not tree.is_leaf:
+                self._apply_ratios(tree)
+        finally:
+            self.controller._applying_layout = False
+            self.controller._layout_applied_time = time.monotonic()
+        return False
+
+    def _record_tmux_sizes(self, node):
+        """Record tmux's reported pane sizes to prevent resize feedback loops."""
+        if node.is_leaf:
+            self.controller._last_pane_sizes[node.pane_id] = (node.width, node.height)
+        else:
+            for child in node.children:
+                self._record_tmux_sizes(child)
+
+    def _apply_ratios(self, node):
+        """Recursively set split ratios on Paned containers to match tmux layout."""
+        if node.is_leaf or len(node.children) < 2:
+            return
+
+        # Find the terminal for the first leaf of child[0] and child[1]
+        first_leaf_0 = self._first_leaf(node.children[0])
+        first_leaf_1 = self._first_leaf(node.children[1])
+        term_0 = self.controller.pane_to_terminal.get(first_leaf_0.pane_id)
+        term_1 = self.controller.pane_to_terminal.get(first_leaf_1.pane_id)
+
+        if term_0 and term_1:
+            # Find their common Paned ancestor
+            paned = self._find_common_paned(term_0, term_1)
+            if paned and hasattr(paned, 'ratio'):
+                child_0 = node.children[0]
+                # For >2 children, child_1 is everything after child_0
+                if node.orientation == 'v':
+                    total = sum(c.height for c in node.children)
+                    first_size = child_0.height
+                else:
+                    total = sum(c.width for c in node.children)
+                    first_size = child_0.width
+                if total > 0:
+                    ratio = first_size / total
+                    if abs(paned.ratio - ratio) > 0.01:
+                        paned.ratio = ratio
+                        paned.set_position_by_ratio()
+
+        # Recurse into children
+        for child in node.children:
+            if not child.is_leaf:
+                self._apply_ratios(child)
+
+    def _find_common_paned(self, term_a, term_b):
+        """Find the Paned widget that is the direct common parent of two terminals."""
+        # Walk up from term_a collecting parents
+        parents_a = []
+        w = term_a.get_parent()
+        while w is not None:
+            parents_a.append(w)
+            w = w.get_parent()
+        # Walk up from term_b and find first match
+        w = term_b.get_parent()
+        while w is not None:
+            if w in parents_a:
+                return w
+            w = w.get_parent()
+        return None
 
     def _close_panes(self, pane_ids):
         """Close terminals for deleted panes. Called on GTK thread."""
@@ -199,62 +296,121 @@ class TmuxHandlers:
             return
 
     def _create_tab_for_window(self, window_id, tree):
-        """Create a new Terminator tab for a tmux window. Called on GTK thread."""
+        """Create a new Terminator tab for a tmux window. Called on GTK thread.
+
+        Builds the full split tree with correct sizes matching tmux's
+        actual pane dimensions.
+        """
         from terminatorlib.factory import Factory
         from terminatorlib.terminator import Terminator
-        from terminatorlib.tmux.layout import layout_to_terminator
 
         term = Terminator()
         maker = Factory()
 
-        # Build flat layout for this single window's panes
-        flat_layout, _, _ = layout_to_terminator(tree, 'tab_root')
+        # Create the first terminal from the first leaf
+        first_pane_id = self._first_leaf(tree).pane_id
+        root_terminal = maker.make('Terminal')
+        root_terminal.tmux_pane_id = first_pane_id
+        self.controller.register_terminal(first_pane_id, root_terminal)
 
-        # For a single pane, just make a terminal
-        pane_ids = get_pane_ids(tree)
-        if len(pane_ids) == 1:
-            pane_id = list(pane_ids)[0]
-            new_terminal = maker.make('Terminal')
-            new_terminal.tmux_pane_id = pane_id
-            self.controller.register_terminal(pane_id, new_terminal)
-        else:
-            # For multiple panes, create the first terminal and we'll
-            # let layout-change handle the splits
-            pane_id = list(pane_ids)[0]
-            new_terminal = maker.make('Terminal')
-            new_terminal.tmux_pane_id = pane_id
-            self.controller.register_terminal(pane_id, new_terminal)
-
-        # Find the window that contains tmux terminals
+        # Add as a new tab
         window = self._find_tmux_window(term)
-        if window:
-            # Ensure window has a notebook
-            from terminatorlib.factory import Factory as F
-            if not window.is_child_notebook():
-                F().make('Notebook', window=window)
-            window.get_child().newtab(widget=new_terminal)
-        else:
+        if not window:
             dbg('TmuxHandlers: no tmux window to add tab to')
             return False
 
-        # Capture initial content for panes in this window
-        for pid in pane_ids:
+        if not window.is_child_notebook():
+            Factory().make('Notebook', window=window)
+        window.get_child().newtab(widget=root_terminal)
+
+        # Now build the rest of the split tree
+        if not tree.is_leaf:
+            self._build_split_tree(tree, root_terminal, maker)
+
+        # Capture initial content for all panes
+        for pid in get_pane_ids(tree):
             self.protocol.send_command(
                 'capture-pane -J -p -t {} -eC -S - -E -'.format(pid),
                 callback=lambda result, p=pid: self._feed_initial_capture(p, result),
             )
         return False
 
+    def _first_leaf(self, node):
+        """Find the first leaf node in a layout tree."""
+        if node.is_leaf:
+            return node
+        return self._first_leaf(node.children[0])
+
+    def _build_split_tree(self, node, terminal, maker):
+        """Recursively split terminals to match the tmux layout tree.
+
+        Starting from a single terminal that represents the first leaf,
+        split it for each additional child in the layout node.
+        """
+        if node.is_leaf:
+            return
+
+        # The terminal currently represents the first child.
+        # For each subsequent child, split from the previous terminal.
+        current_terminal = terminal
+        for i in range(1, len(node.children)):
+            child = node.children[i]
+            first_leaf = self._first_leaf(child)
+
+            new_terminal = maker.make('Terminal')
+            new_terminal.tmux_pane_id = first_leaf.pane_id
+            self.controller.register_terminal(first_leaf.pane_id, new_terminal)
+
+            # vertical=True means VPaned (top/bottom split) = tmux 'v' orientation
+            vertical = node.orientation == 'v'
+
+            # Calculate ratio: size of everything before this child / total
+            if vertical:
+                prev_size = sum(node.children[j].height for j in range(i))
+                total_size = sum(c.height for c in node.children)
+            else:
+                prev_size = sum(node.children[j].width for j in range(i))
+                total_size = sum(c.width for c in node.children)
+
+            parent = current_terminal.get_parent()
+            parent.split_axis(current_terminal, vertical=vertical,
+                              sibling=new_terminal, widgetfirst=True)
+
+            # Set the ratio on the newly created paned container
+            paned = current_terminal.get_parent()
+            if hasattr(paned, 'ratio') and total_size > 0:
+                # For the i-th split, ratio is first_child / (first + second)
+                first_child = node.children[i - 1]
+                if vertical:
+                    ratio = first_child.height / (first_child.height + child.height)
+                else:
+                    ratio = first_child.width / (first_child.width + child.width)
+                paned.ratio = ratio
+                paned.set_position_by_ratio()
+
+            # If the child itself has sub-splits, recurse
+            if not child.is_leaf:
+                self._build_split_tree(child, new_terminal, maker)
+
+            # The current terminal for the next iteration stays the same
+            # (we always split from the last terminal added)
+            current_terminal = new_terminal
+
+        # Also recurse into the first child if it has sub-splits
+        first_child = node.children[0]
+        if not first_child.is_leaf:
+            self._build_split_tree(first_child, terminal, maker)
+
     def on_window_close(self, info):
         """Handle %window-close: close all terminals in that window."""
         window_id = info.get('window_id', '')
-        dbg('TmuxHandlers: window-close: %s (known trees: %s)' % (
+        tmux_dbg('window-close: %s (known trees: %s)' % (
             window_id, list(self._layout_trees.keys())))
         tree = self._layout_trees.pop(window_id, None)
         self.controller.window_layouts.pop(window_id, None)
         if tree:
             pane_ids = get_pane_ids(tree)
-            dbg('TmuxHandlers: closing panes: %s' % pane_ids)
+            tmux_dbg('closing panes: %s' % pane_ids)
             GLib.idle_add(self._close_panes, pane_ids)
         else:
             dbg('TmuxHandlers: no tree found for window %s' % window_id)
@@ -326,20 +482,11 @@ class TmuxHandlers:
 
     def _send_initial_resize(self):
         """Send refresh-client with actual terminal dimensions."""
-        max_cols = 0
-        max_rows = 0
-        for terminal in self.controller.pane_to_terminal.values():
-            try:
-                c = terminal.vte.get_column_count()
-                r = terminal.vte.get_row_count()
-                max_cols = max(max_cols, c)
-                max_rows = max(max_rows, r)
-            except Exception:
-                pass
-        if max_cols > 0 and max_rows > 0:
-            dbg('TmuxHandlers: initial resize to %dx%d' % (max_cols, max_rows))
+        cols, rows = self.controller._calculate_client_size()
+        if cols > 0 and rows > 0:
+            tmux_dbg('initial resize to %dx%d' % (cols, rows))
             self.protocol.send_command(
-                'refresh-client -C {},{}'.format(max_cols, max_rows))
+                'refresh-client -C {},{}'.format(cols, rows))
 
     def _feed_initial_capture(self, pane_id, result):
         """Feed initially captured content to the right terminal."""

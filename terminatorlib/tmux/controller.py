@@ -10,6 +10,7 @@ from gi.repository import Gdk, GLib
 
 from terminatorlib.borg import Borg
 from terminatorlib.util import dbg
+from terminatorlib.tmux import tmux_dbg
 from terminatorlib.tmux.protocol import TmuxProtocol, TmuxProtocolFromPty
 from terminatorlib.tmux.layout import parse_tmux_layout, build_terminator_layout
 
@@ -70,6 +71,11 @@ class TmuxController(Borg):
     window_layouts = None
     _resize_timer = None
     _initial_layout_ready = None
+    _last_client_size = None
+    _last_pane_sizes = None
+    _last_window_pixels = None
+    _applying_layout = None
+    _layout_applied_time = None
 
     def __init__(self):
         Borg.__init__(self, self.__class__.__name__)
@@ -82,6 +88,9 @@ class TmuxController(Borg):
             self.terminal_to_pane = {}
             self.pane_alternate = {}
             self.window_layouts = {}
+            self._last_pane_sizes = {}
+            self._applying_layout = False
+            self._layout_applied_time = 0
             self._resize_timer = None
             self._initial_layout_ready = threading.Event()
 
@@ -284,38 +293,185 @@ class TmuxController(Borg):
         return True
 
     def notify_resize(self, terminal, cols, rows):
-        """Notify tmux of terminal resize. Debounced to 100ms.
-
-        Sends both the overall client size and individual pane resize.
-        """
+        """Notify tmux of terminal resize. Debounced to 100ms."""
+        # Don't send resize while we're applying a layout from tmux
+        if self._applying_layout:
+            return
         # Cancel any pending resize
         if self._resize_timer:
             GLib.source_remove(self._resize_timer)
 
         def do_resize():
             self._resize_timer = None
-            # Calculate total client size from all registered terminals
-            max_cols = 0
-            max_rows = 0
+
+            # Detect if the overall window changed size (vs just a split drag)
+            window_resized = False
             for t in self.terminal_to_pane:
                 try:
-                    c = t.vte.get_column_count()
-                    r = t.vte.get_row_count()
-                    max_cols = max(max_cols, c)
-                    max_rows = max(max_rows, r)
+                    top = t.get_toplevel()
+                    alloc = top.get_allocation()
+                    px = (alloc.width, alloc.height)
+                    if px != self._last_window_pixels:
+                        tmux_dbg('window pixels changed %s -> %s' % (self._last_window_pixels, px))
+                        self._last_window_pixels = px
+                        window_resized = True
+                    break
                 except Exception:
                     pass
-            if max_cols > 0 and max_rows > 0:
-                self.protocol.send_command(
-                    'refresh-client -C {},{}'.format(max_cols, max_rows))
-            # Resize the individual pane
-            pane_id = self.terminal_to_pane.get(terminal)
-            if pane_id:
-                self.protocol.send_command(
-                    'resize-pane -t {} -x {} -y {}'.format(pane_id, cols, rows))
+
+            if window_resized:
+                for t, pane_id in self.terminal_to_pane.items():
+                    self._debug_terminal_sizes(t, pane_id)
+                total_cols, total_rows = self._calculate_client_size()
+                tmux_dbg('calculated client size: %dx%d (last: %s)' % (
+                    total_cols, total_rows, self._last_client_size))
+                if total_cols > 0 and total_rows > 0:
+                    size = (total_cols, total_rows)
+                    if size != self._last_client_size:
+                        self._last_client_size = size
+                        tmux_dbg('sending refresh-client -C %d,%d' % (total_cols, total_rows))
+                        self.protocol.send_command(
+                            'refresh-client -C {},{}'.format(total_cols, total_rows))
+            else:
+                # Split bar dragged — resize panes using exact VTE sizes
+                # Skip if a tmux layout change was applied recently
+                # (those VTE size changes are from tmux, not the user)
+                import time
+                if time.monotonic() - self._layout_applied_time < 0.3:
+                    return False
+                for t, pane_id in self.terminal_to_pane.items():
+                    try:
+                        c = t.vte.get_column_count()
+                        r = t.vte.get_row_count()
+                        tmux_size = self._last_pane_sizes.get(pane_id, (0, 0))
+                        overhead_c, overhead_r = self._chrome_overhead(t)
+                        col_diff = abs(c - tmux_size[0])
+                        row_diff = abs(r - tmux_size[1])
+                        if col_diff > overhead_c or row_diff > overhead_r:
+                            tmux_dbg('resize-pane %s tmux=%s vte=%dx%d overhead=%dx%d' % (
+                                pane_id, tmux_size, c, r, overhead_c, overhead_r))
+                            self._last_pane_sizes[pane_id] = (c, r)
+                            self.protocol.send_command(
+                                'resize-pane -t {} -x {} -y {}'.format(pane_id, c, r))
+                    except Exception:
+                        pass
             return False
 
         self._resize_timer = GLib.timeout_add(100, do_resize)
+
+    def _pane_size_for_tmux(self, terminal):
+        """Get the tmux pane size for a terminal. Returns exact VTE size."""
+        return terminal.vte.get_column_count(), terminal.vte.get_row_count()
+
+    def _chrome_overhead(self, terminal):
+        """Calculate the chrome overhead for a terminal in character cells.
+
+        Returns (extra_cols, extra_rows) consumed by titlebar, scrollbar,
+        and other widgets that reduce VTE's usable area within the
+        Terminal widget. Measured live from current widget allocations.
+        """
+        vte = terminal.vte
+        char_w = vte.get_char_width()
+        char_h = vte.get_char_height()
+        if char_w <= 0 or char_h <= 0:
+            return 0, 0
+
+        extra_h = 0
+        if hasattr(terminal, 'titlebar') and terminal.titlebar and terminal.titlebar.get_visible():
+            extra_h += terminal.titlebar.get_allocation().height
+
+        extra_w = 0
+        if hasattr(terminal, 'scrollbar') and terminal.scrollbar and terminal.scrollbar.get_visible():
+            extra_w += terminal.scrollbar.get_allocation().width
+
+        return extra_w // char_w, extra_h // char_h
+
+    def _debug_terminal_sizes(self, terminal, pane_id):
+        """Log all pixel and character measurements for a terminal."""
+        vte = terminal.vte
+        char_w = vte.get_char_width()
+        char_h = vte.get_char_height()
+        vte_alloc = vte.get_allocation()
+        term_alloc = terminal.get_allocation()
+        vte_cols = vte.get_column_count()
+        vte_rows = vte.get_row_count()
+
+        tb_h = 0
+        sb_w = 0
+        if hasattr(terminal, 'titlebar') and terminal.titlebar and terminal.titlebar.get_visible():
+            tb_h = terminal.titlebar.get_allocation().height
+        if hasattr(terminal, 'scrollbar') and terminal.scrollbar and terminal.scrollbar.get_visible():
+            sb_w = terminal.scrollbar.get_allocation().width
+
+        tmux_dbg('DEBUG %s: cell=%dx%d vte_px=%dx%d vte_chars=%dx%d '
+            'term_px=%dx%d titlebar_h=%d scrollbar_w=%d' % (
+            pane_id, char_w, char_h,
+            vte_alloc.width, vte_alloc.height, vte_cols, vte_rows,
+            term_alloc.width, term_alloc.height, tb_h, sb_w))
+
+    def _calculate_client_size(self):
+        """Calculate the total tmux client size.
+
+        For single pane: VTE's exact column/row count.
+        For splits: uses the layout tree to sum VTE sizes plus
+        1 character per tmux separator between panes.
+        """
+        terminals = list(self.terminal_to_pane.keys())
+        if not terminals:
+            return 0, 0
+
+        if len(terminals) == 1:
+            t = terminals[0]
+            try:
+                return t.vte.get_column_count(), t.vte.get_row_count()
+            except Exception:
+                return 0, 0
+
+        if self.handlers and self.handlers._layout_trees:
+            for tree in self.handlers._layout_trees.values():
+                cols, rows = self._calc_node_size(tree)
+                tmux_dbg('client size: %dx%d' % (cols, rows))
+                return cols, rows
+
+        t = terminals[0]
+        try:
+            return t.vte.get_column_count(), t.vte.get_row_count()
+        except Exception:
+            return 0, 0
+
+    def _calc_node_size(self, node):
+        """Calculate total character size including chrome overhead.
+
+        Adds 1 per tmux separator between sibling panes.
+        """
+        if node.is_leaf:
+            terminal = self.pane_to_terminal.get(node.pane_id)
+            if terminal:
+                try:
+                    c, r = self._pane_size_for_tmux(terminal)
+                    tmux_dbg('  leaf %s: vte=%dx%d tmux_tree=%dx%d' % (
+                        node.pane_id, c, r, node.width, node.height))
+                    return c, r
+                except Exception:
+                    pass
+            tmux_dbg('  leaf %s: no terminal, using tree=%dx%d' % (
+                node.pane_id, node.width, node.height))
+            return node.width, node.height
+
+        child_sizes = [self._calc_node_size(c) for c in node.children]
+        n_seps = len(child_sizes) - 1
+        if node.orientation == 'h':
+            total_cols = sum(s[0] for s in child_sizes)
+            max_rows = max((s[1] for s in child_sizes), default=0)
+            tmux_dbg('  h-split: children=%s -> %dx%d (no sep added)' % (
+                child_sizes, total_cols, max_rows))
+            return total_cols, max_rows
+        else:
+            max_cols = max((s[0] for s in child_sizes), default=0)
+            total_rows = sum(s[1] for s in child_sizes)
+            tmux_dbg('  v-split: children=%s -> %dx%d (no sep added)' % (
+                child_sizes, max_cols, total_rows))
+            return max_cols, total_rows
 
     def get_initial_layout(self):
         """Build Terminator layout from tmux's current state.
