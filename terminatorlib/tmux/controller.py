@@ -284,15 +284,35 @@ class TmuxController(Borg):
         return True
 
     def notify_resize(self, terminal, cols, rows):
-        """Notify tmux of terminal resize. Debounced to 100ms."""
+        """Notify tmux of terminal resize. Debounced to 100ms.
+
+        Sends both the overall client size and individual pane resize.
+        """
         # Cancel any pending resize
         if self._resize_timer:
             GLib.source_remove(self._resize_timer)
 
         def do_resize():
             self._resize_timer = None
-            self.protocol.send_command(
-                'refresh-client -C {},{}'.format(cols, rows))
+            # Calculate total client size from all registered terminals
+            max_cols = 0
+            max_rows = 0
+            for t in self.terminal_to_pane:
+                try:
+                    c = t.vte.get_column_count()
+                    r = t.vte.get_row_count()
+                    max_cols = max(max_cols, c)
+                    max_rows = max(max_rows, r)
+                except Exception:
+                    pass
+            if max_cols > 0 and max_rows > 0:
+                self.protocol.send_command(
+                    'refresh-client -C {},{}'.format(max_cols, max_rows))
+            # Resize the individual pane
+            pane_id = self.terminal_to_pane.get(terminal)
+            if pane_id:
+                self.protocol.send_command(
+                    'resize-pane -t {} -x {} -y {}'.format(pane_id, cols, rows))
             return False
 
         self._resize_timer = GLib.timeout_add(100, do_resize)

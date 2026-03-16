@@ -315,12 +315,31 @@ class TmuxHandlers:
 
     def capture_initial_content(self):
         """Capture and display initial pane content after terminals are registered."""
+        # Send initial client size based on actual terminal dimensions
+        self._send_initial_resize()
         for window_id, tree in self._layout_trees.items():
             for pane_id in get_pane_ids(tree):
                 self.protocol.send_command(
                     'capture-pane -J -p -t {} -eC -S - -E -'.format(pane_id),
                     callback=lambda result, pid=pane_id: self._feed_initial_capture(pid, result),
                 )
+
+    def _send_initial_resize(self):
+        """Send refresh-client with actual terminal dimensions."""
+        max_cols = 0
+        max_rows = 0
+        for terminal in self.controller.pane_to_terminal.values():
+            try:
+                c = terminal.vte.get_column_count()
+                r = terminal.vte.get_row_count()
+                max_cols = max(max_cols, c)
+                max_rows = max(max_rows, r)
+            except Exception:
+                pass
+        if max_cols > 0 and max_rows > 0:
+            dbg('TmuxHandlers: initial resize to %dx%d' % (max_cols, max_rows))
+            self.protocol.send_command(
+                'refresh-client -C {},{}'.format(max_cols, max_rows))
 
     def _feed_initial_capture(self, pane_id, result):
         """Feed initially captured content to the right terminal."""
