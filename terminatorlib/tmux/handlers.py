@@ -314,13 +314,11 @@ class TmuxHandlers:
                     and terminal.titlebar.get_visible()
                     and terminal.titlebar.get_parent() == terminal):
                 tb_h = terminal.titlebar.get_allocation().height
-            # VTE internal padding — the space VTE reserves before
-            # laying out character cells (typically 1px each side)
-            from gi.repository import Gtk
-            padding = terminal.vte.get_style_context().get_padding(
-                Gtk.StateFlags.NORMAL)
-            vte_pad_x = padding.left + padding.right
-            vte_pad_y = padding.top + padding.bottom
+            # VTE padding is zeroed globally via CSS (vte-terminal { padding: 0 }).
+            # Don't query style context — per-VTE centering CSS overrides
+            # would be read back and corrupt sizing calculations.
+            vte_pad_x = 0
+            vte_pad_y = 0
             return char_w, char_h, sb_w, tb_h, vte_pad_x, vte_pad_y
         except Exception:
             return 0, 0, 0, 0, 0, 0

@@ -579,45 +579,59 @@ class VPaned(Paned, Gtk.VPaned):
     _measured_gap = None  # actual pixel gap, measured after first layout
 
     _measured_gap = None  # actual pixel gap, measured after first layout
-    # When True, split dead space evenly above/below handle using
-    # VTE padding-top on child2. When False, all dead space above handle.
     _center_spacing = False
 
     def _snap_position(self, widget, pspec):
-        """Snap handle so child2 starts at a character cell boundary."""
+        """Snap handle so child2 starts at a character cell boundary.
+
+        When _center_spacing is True, applies VTE padding to visually
+        center the handle in the character gap.
+        """
         snap = VPaned._char_snap
         if self._snapping or snap <= 0:
             return
         pos = self.get_position()
         gap = self._measured_gap if self._measured_gap else self.get_handlesize()
 
-        if VPaned._center_spacing:
-            half_pad = max((snap - self.get_handlesize()) // 2, 0)
-        else:
-            half_pad = 0
-
-        n = round((pos + gap + half_pad) / snap)
-        snapped = max(n * snap - gap - half_pad, 0)
+        # Snap child2 to char_h boundary (no offset from centering —
+        # centering is done purely with VTE padding, not snap shift)
+        n = round((pos + gap) / snap)
+        snapped = max(n * snap - gap, 0)
         if snapped != pos:
             self._snapping = True
             self.set_pos(snapped)
             self._snapping = False
 
-        # Apply padding-top to child2's VTE if centering
-        if half_pad > 0:
+        # Apply VTE padding for centering: padding-top on child2,
+        # padding-bottom on child1. Each gets half the dead space.
+        if VPaned._center_spacing and self._measured_gap is not None:
+            dead = snapped % snap if snap > 0 else 0
+            pad_bottom = dead // 2
+            pad_top = dead - pad_bottom
+            # child1's VTE: padding-bottom
+            child1 = self.get_child1()
+            if child1:
+                vte1 = getattr(child1, 'vte', None)
+                if vte1 and not hasattr(vte1, '_sep_pad_applied'):
+                    vte1._sep_pad_applied = True
+                    from gi.repository import Gtk
+                    p = Gtk.CssProvider()
+                    p.load_from_data(
+                        ('* { padding-bottom: %dpx; }' % pad_bottom).encode())
+                    vte1.get_style_context().add_provider(
+                        p, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 20)
+            # child2's VTE: padding-top
             child2 = self.get_child2()
             if child2:
-                child2.set_margin_top(0)
-                vte = getattr(child2, 'vte', None)
-                if vte and not hasattr(vte, '_below_sep_pad'):
-                    vte._below_sep_pad = True
+                vte2 = getattr(child2, 'vte', None)
+                if vte2 and not hasattr(vte2, '_sep_pad_applied'):
+                    vte2._sep_pad_applied = True
                     from gi.repository import Gtk
-                    provider = Gtk.CssProvider()
-                    provider.load_from_data(
-                        ('* { padding-top: %dpx; }' % half_pad).encode())
-                    vte.get_style_context().add_provider(
-                        provider,
-                        Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 20)
+                    p = Gtk.CssProvider()
+                    p.load_from_data(
+                        ('* { padding-top: %dpx; }' % pad_top).encode())
+                    vte2.get_style_context().add_provider(
+                        p, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 20)
 
         # Measure actual gap after layout settles (once)
         if self._measured_gap is None:
@@ -631,6 +645,11 @@ class VPaned(Paned, Gtk.VPaned):
                     actual = a2.y - (a1.y + a1.height)
                     if actual > 0:
                         self._measured_gap = actual
+                        from terminatorlib.tmux import tmux_dbg
+                        tmux_dbg('VPaned measured gap=%d handle=%d '
+                                 'wide_handle=%s' % (
+                                     actual, self.get_handlesize(),
+                                     self.props.wide_handle))
                         self._snap_position(self, None)
                 return False
             GLib.idle_add(_measure)
