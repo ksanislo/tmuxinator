@@ -363,7 +363,10 @@ class Terminator(Borg):
             window, terminal = self.new_window()
             if 'tmux_size' in layout[windef]:
                 size = layout[windef]['tmux_size']
-                window.resize(int(size[0]) * 8, int(size[1]) * 16)
+                # Rough estimate — real sizing happens in
+                # handlers._send_initial_resize once VTEs are realized
+                # and we can measure actual char/scrollbar/titlebar sizes.
+                window.resize(int(size[0]) * 10, int(size[1]) * 20)
             window.create_layout(layout[windef])
 
         self.layoutname = 'tmux'

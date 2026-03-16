@@ -451,13 +451,12 @@ class TmuxController(Borg):
             term_alloc.width, term_alloc.height, tb_h, sb_w))
 
     def _calculate_client_size(self):
-        """Calculate the total tmux client size from the pixel bounding box.
+        """Calculate the total tmux client size from VTE grid sizes.
 
-        Measures the total pixel area occupied by all VTE widgets,
-        then divides by character cell size. The VTE bounding box
-        already excludes chrome (titlebars, scrollbars) since those
-        are separate widgets. Pane handle pixels between VTEs correspond
-        to tmux's separator characters and are naturally included.
+        Sums individual VTE column/row counts using the layout tree
+        structure, adding 1 character per tmux separator between panes.
+        This avoids the bounding-box approach which inflates the count
+        by including scrollbar and handle pixels in the character total.
         """
         terminals = list(self.terminal_to_pane.keys())
         if not terminals:
@@ -470,95 +469,57 @@ class TmuxController(Borg):
             except Exception:
                 return 0, 0
 
-        # Find the bounding box of all VTE widgets in pixel coordinates
-        # relative to the toplevel window
+        # Use layout tree to sum VTE sizes + 1 per tmux separator
+        if self.handlers and self.handlers._layout_trees:
+            for tree in self.handlers._layout_trees.values():
+                cols, rows = self._sum_vte_sizes(tree)
+                if cols > 0 and rows > 0:
+                    tmux_dbg('client size: %dx%d (from VTE grid + separators)' % (
+                        cols, rows))
+                    return cols, rows
+
+        # Fallback: single terminal sizes
+        t = terminals[0]
         try:
-            ref = terminals[0].get_toplevel()
-            char_w = terminals[0].vte.get_char_width()
-            char_h = terminals[0].vte.get_char_height()
-            if char_w <= 0 or char_h <= 0:
-                return 0, 0
-
-            min_x = float('inf')
-            min_y = float('inf')
-            max_x = 0
-            max_y = 0
-
-            for t in terminals:
-                vte = t.vte
-                alloc = vte.get_allocation()
-                # translate_coordinates returns (x, y) or None
-                coords = vte.translate_coordinates(ref, 0, 0)
-                if coords is None:
-                    continue
-                x, y = coords
-                min_x = min(min_x, x)
-                min_y = min(min_y, y)
-                max_x = max(max_x, x + alloc.width)
-                max_y = max(max_y, y + alloc.height)
-
-            if min_x == float('inf'):
-                return 0, 0
-
-            bbox_w = max_x - min_x
-            bbox_h = max_y - min_y
-            cols = int(bbox_w // char_w)
-            rows = int(bbox_h // char_h)
-            tmux_dbg('client size: %dx%d (bbox %dx%d px, cell %dx%d)' % (
-                cols, rows, bbox_w, bbox_h, char_w, char_h))
-            return cols, rows
-        except Exception as e:
-            tmux_dbg('client size calc error: %s' % e)
-            # Fallback to single terminal
-            t = terminals[0]
-            try:
-                return t.vte.get_column_count(), t.vte.get_row_count()
-            except Exception:
-                return 0, 0
-
-    def _calculate_window_resize_pixels(self, target_cols, target_rows):
-        """Calculate pixel dimensions needed to resize the GTK window so
-        the VTE grid matches target_cols x target_rows.
-
-        Returns (width_px, height_px) or None if no resize is needed.
-        """
-        terminals = list(self.terminal_to_pane.keys())
-        if not terminals:
-            return None
-        try:
-            ref = terminals[0].get_toplevel()
-            char_w = terminals[0].vte.get_char_width()
-            char_h = terminals[0].vte.get_char_height()
-            if char_w <= 0 or char_h <= 0:
-                return None
-
-            # Current VTE bounding box (same logic as _calculate_client_size)
-            min_x, min_y = float('inf'), float('inf')
-            max_x, max_y = 0, 0
-            for t in terminals:
-                coords = t.vte.translate_coordinates(ref, 0, 0)
-                if coords is None:
-                    continue
-                x, y = coords
-                alloc = t.vte.get_allocation()
-                min_x = min(min_x, x); min_y = min(min_y, y)
-                max_x = max(max_x, x + alloc.width); max_y = max(max_y, y + alloc.height)
-            if min_x == float('inf'):
-                return None
-
-            current_cols = int((max_x - min_x) // char_w)
-            current_rows = int((max_y - min_y) // char_h)
-            if (current_cols, current_rows) == (target_cols, target_rows):
-                return None  # no resize needed
-
-            # Chrome = window pixels minus VTE bbox pixels
-            win_alloc = ref.get_allocation()
-            chrome_w = win_alloc.width - (max_x - min_x)
-            chrome_h = win_alloc.height - (max_y - min_y)
-            return (int(target_cols * char_w + chrome_w),
-                    int(target_rows * char_h + chrome_h))
+            return t.vte.get_column_count(), t.vte.get_row_count()
         except Exception:
-            return None
+            return 0, 0
+
+    def _sum_vte_sizes(self, node):
+        """Compute total character size from actual VTE widgets + tmux separators.
+
+        Walks the layout tree, reads each leaf's VTE column/row count,
+        and sums them with +1 per separator (matching tmux's layout math).
+        Detects unallocated widgets (1x1 pixel) and falls back to tmux
+        node dimensions to avoid stale set_size() column counts.
+        """
+        if node.is_leaf:
+            terminal = self.pane_to_terminal.get(node.pane_id)
+            if terminal:
+                try:
+                    vte_alloc = terminal.vte.get_allocation()
+                    char_w = terminal.vte.get_char_width()
+                    char_h = terminal.vte.get_char_height()
+                    if (char_w > 0 and char_h > 0
+                            and vte_alloc.width > char_w
+                            and vte_alloc.height > char_h):
+                        return (terminal.vte.get_column_count(),
+                                terminal.vte.get_row_count())
+                except Exception:
+                    pass
+            return node.width, node.height
+
+        child_sizes = [self._sum_vte_sizes(c) for c in node.children]
+        n_seps = len(child_sizes) - 1
+
+        if node.orientation == 'h':
+            total_cols = sum(s[0] for s in child_sizes) + n_seps
+            max_rows = max((s[1] for s in child_sizes), default=0)
+            return total_cols, max_rows
+        else:
+            max_cols = max((s[0] for s in child_sizes), default=0)
+            total_rows = sum(s[1] for s in child_sizes) + n_seps
+            return max_cols, total_rows
 
     def get_initial_layout(self):
         """Build Terminator layout from tmux's current state.
