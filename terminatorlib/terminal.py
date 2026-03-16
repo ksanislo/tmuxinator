@@ -951,13 +951,24 @@ class Terminal(Gtk.VBox):
         if bg_factor > 1.0:
             bg_factor = 1.0
         self.bgcolor_inactive = self.bgcolor.copy()
-        dbg(("bgcolor_inactive set to: RGB(%s,%s,%s)", getattr(self.bgcolor_inactive, "red"),
-                                                      getattr(self.bgcolor_inactive, "green"),
-                                                      getattr(self.bgcolor_inactive, "blue")))
 
-        for bit in ['red', 'green', 'blue']:
-            setattr(self.bgcolor_inactive, bit,
-                    getattr(self.bgcolor_inactive, bit) * bg_factor)
+        # Determine if background is dark or light based on
+        # average brightness (perceptual luminance)
+        brightness = (self.bgcolor.red * 0.299 +
+                      self.bgcolor.green * 0.587 +
+                      self.bgcolor.blue * 0.114)
+        if brightness < 0.5:
+            # Dark background: blend toward white to lighten inactive
+            for bit in ['red', 'green', 'blue']:
+                val = getattr(self.bgcolor_inactive, bit)
+                setattr(self.bgcolor_inactive, bit,
+                        val + (1.0 - val) * (1.0 - bg_factor))
+        else:
+            # Light background: multiply to darken inactive (original behavior)
+            for bit in ['red', 'green', 'blue']:
+                setattr(self.bgcolor_inactive, bit,
+                        getattr(self.bgcolor_inactive, bit) * bg_factor)
+
         dbg(("bgcolor_inactive set to: RGB(%s,%s,%s)", getattr(self.bgcolor_inactive, "red"),
                                                       getattr(self.bgcolor_inactive, "green"),
                                                       getattr(self.bgcolor_inactive, "blue")))
