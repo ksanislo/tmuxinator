@@ -289,10 +289,9 @@ class TmuxHandlers:
             alloc = terminal.vte.get_allocation()
             if char_w <= 0 or char_h <= 0 or alloc.width <= char_w or alloc.height <= char_h:
                 return 0, 0, 0, 0, 0, 0
+            # Scrollbar is overlaid (Gtk.Overlay) — it doesn't consume
+            # layout space, so sb_w is always 0 for pixel calculations.
             sb_w = 0
-            if (hasattr(terminal, 'scrollbar') and terminal.scrollbar
-                    and terminal.scrollbar.get_visible()):
-                sb_w = terminal.scrollbar.get_allocation().width
             tb_h = 0
             if (hasattr(terminal, 'titlebar') and terminal.titlebar
                     and terminal.titlebar.get_visible()):
@@ -316,6 +315,16 @@ class TmuxHandlers:
                 return w.get_handlesize()
             w = w.get_parent()
         return 0
+
+    def _find_root_paned(self, terminal):
+        """Find the highest Paned ancestor (the content container)."""
+        root_paned = None
+        w = terminal.get_parent()
+        while w is not None:
+            if hasattr(w, 'get_handlesize'):
+                root_paned = w
+            w = w.get_parent()
+        return root_paned
 
     def _find_common_paned(self, term_a, term_b):
         """Find the Paned widget that is the direct common parent of two terminals."""
@@ -376,6 +385,7 @@ class TmuxHandlers:
             # Create new terminal
             new_terminal = maker.make('Terminal')
             new_terminal.tmux_pane_id = pane_id
+            new_terminal._make_titlebar_overlay()
             self.controller.register_terminal(pane_id, new_terminal)
 
             # Capture initial content
@@ -454,6 +464,7 @@ class TmuxHandlers:
         first_pane_id = self._first_leaf(tree).pane_id
         root_terminal = maker.make('Terminal')
         root_terminal.tmux_pane_id = first_pane_id
+        root_terminal._make_titlebar_overlay()
         self.controller.register_terminal(first_pane_id, root_terminal)
 
         # Add as a new tab
@@ -502,6 +513,7 @@ class TmuxHandlers:
 
             new_terminal = maker.make('Terminal')
             new_terminal.tmux_pane_id = first_leaf.pane_id
+            new_terminal._make_titlebar_overlay()
             self.controller.register_terminal(first_leaf.pane_id, new_terminal)
 
             # vertical=True means VPaned (top/bottom split) = tmux 'v' orientation
@@ -614,7 +626,6 @@ class TmuxHandlers:
 
     def capture_initial_content(self):
         """Capture and display initial pane content after terminals are registered."""
-        # Send initial client size based on actual terminal dimensions
         self._send_initial_resize()
         for window_id, tree in self._layout_trees.items():
             for pane_id in get_pane_ids(tree):
@@ -657,15 +668,27 @@ class TmuxHandlers:
 
         handle_size = self._get_handle_size(term)
 
-        # Compute pixel dimensions for tmux's layout
+        # Compute pixel dimensions for tmux's layout (content area)
         target_w = self._subtree_px(tree, 'h', char_w, char_h, sb_w, tb_h,
                                      handle_size, vpad_x, vpad_y)
         target_h = self._subtree_px(tree, 'v', char_w, char_h, sb_w, tb_h,
                                      handle_size, vpad_x, vpad_y)
 
+        # Chrome between window content area and root Paned.
+        # window.resize() sets the content child (e.g. Notebook) size.
+        # The root Paned is inside that, minus borders and tab bar.
+        window = term.get_toplevel()
+        root_paned = self._find_root_paned(term)
+        chrome_w = chrome_h = 0
+        content = window.get_child()
+        if content and root_paned:
+            content_alloc = content.get_allocation()
+            paned_alloc = root_paned.get_allocation()
+            chrome_w = content_alloc.width - paned_alloc.width
+            chrome_h = content_alloc.height - paned_alloc.height
+
         # Get screen limits
         from gi.repository import Gdk
-        window = term.get_toplevel()
         screen = window.get_screen()
         monitor = screen.get_monitor_at_window(window.get_window()) \
             if window.get_window() else 0
@@ -673,15 +696,18 @@ class TmuxHandlers:
         max_w = mon_geom.width
         max_h = mon_geom.height
 
-        # Determine if we can fit tmux's layout
-        fits = target_w <= max_w and target_h <= max_h
-        win_w = min(int(target_w), max_w)
-        win_h = min(int(target_h), max_h)
+        # Target: paned content + chrome between content child and paned
+        target_win_w = int(target_w) + chrome_w
+        target_win_h = int(target_h) + chrome_h
+        fits = target_win_w <= max_w and target_win_h <= max_h
+        win_w = min(target_win_w, max_w)
+        win_h = min(target_win_h, max_h)
 
-        tmux_dbg('initial sizing: tmux=%dx%d target=%dx%dpx '
-                 'screen=%dx%d fits=%s char=%dx%d sb=%d tb=%d '
-                 'handle=%d vte_pad=%dx%d' % (
+        tmux_dbg('initial sizing: tmux=%dx%d target_paned=%dx%dpx '
+                 'chrome=%dx%d target_win=%dx%d screen=%dx%d fits=%s '
+                 'char=%dx%d sb=%d tb=%d handle=%d vte_pad=%dx%d' % (
                      tree.width, tree.height, target_w, target_h,
+                     chrome_w, chrome_h, win_w, win_h,
                      max_w, max_h, fits,
                      char_w, char_h, sb_w, tb_h,
                      handle_size, vpad_x, vpad_y))

@@ -320,17 +320,60 @@ class Terminal(Gtk.VBox):
             del(self.vte)
 
     def create_terminalbox(self):
-        """Create a GtkHBox containing the terminal and a scrollbar"""
+        """Create a container with the terminal and an overlay scrollbar.
 
-        terminalbox = Gtk.Box.new(Gtk.Orientation.HORIZONTAL, 0)
-        self.scrollbar = Gtk.Scrollbar.new(Gtk.Orientation.VERTICAL, adjustment=self.vte.get_vadjustment())
+        Uses Gtk.Overlay so the scrollbar floats on top of the VTE's
+        right edge instead of taking its own horizontal space. This
+        means the VTE gets the full terminal width — no pixels lost
+        to the scrollbar, which keeps character column counts accurate
+        across split panes.
+        """
+        adj = self.vte.get_vadjustment()
+        self.scrollbar = Gtk.Scrollbar.new(Gtk.Orientation.VERTICAL,
+                                           adjustment=adj)
         self.scrollbar.set_no_show_all(True)
+        self.scrollbar.set_opacity(0.0)
 
-        terminalbox.pack_start(self.vte, True, True, 0)
-        terminalbox.pack_start(self.scrollbar, False, True, 0)
-        terminalbox.show_all()
+        # Align scrollbar to right edge of the overlay
+        self.scrollbar.set_halign(Gtk.Align.END)
+        self.scrollbar.set_valign(Gtk.Align.FILL)
 
-        return(terminalbox)
+        # Show scrollbar only when scrolled back in history
+        def _on_adj_changed(*args):
+            at_bottom = adj.get_value() >= adj.get_upper() - adj.get_page_size() - 1
+            self.scrollbar.set_opacity(0.0 if at_bottom else 0.5)
+        adj.connect('value-changed', _on_adj_changed)
+        adj.connect('changed', _on_adj_changed)
+
+        self._terminalbox_overlay = Gtk.Overlay()
+        self._terminalbox_overlay.add(self.vte)
+        self._terminalbox_overlay.add_overlay(self.scrollbar)
+        self._terminalbox_overlay.show_all()
+
+        return self._terminalbox_overlay
+
+    def _make_titlebar_overlay(self):
+        """Move the titlebar into the terminal overlay.
+
+        Makes it float over the VTE content, fully transparent until
+        the mouse hovers over the titlebar area. Takes zero vertical
+        space in the layout.
+        """
+        if not self.titlebar:
+            return
+        # Reparent: remove from VBox, add to the overlay
+        self.remove(self.titlebar)
+        self.titlebar.set_opacity(0.0)
+        self.titlebar.set_halign(Gtk.Align.FILL)
+        if self.config['title_at_bottom']:
+            self.titlebar.set_valign(Gtk.Align.END)
+        else:
+            self.titlebar.set_valign(Gtk.Align.START)
+        self._terminalbox_overlay.add_overlay(self.titlebar)
+        self.titlebar.connect('enter-notify-event',
+                              lambda w, e: w.set_opacity(0.85))
+        self.titlebar.connect('leave-notify-event',
+                              lambda w, e: w.set_opacity(0.0))
 
     def load_plugins(self, force = False):
         registry = plugin.PluginRegistry()
@@ -1002,9 +1045,9 @@ class Terminal(Gtk.VBox):
         else:
             self.scrollbar.show()
             if self.config['scrollbar_position'] == 'left':
-                self.terminalbox.reorder_child(self.scrollbar, 0)
-            elif self.config['scrollbar_position'] == 'right':
-                self.terminalbox.reorder_child(self.vte, 0)
+                self.scrollbar.set_halign(Gtk.Align.START)
+            else:
+                self.scrollbar.set_halign(Gtk.Align.END)
 
         self.titlebar.update()
         self.vte.queue_draw()
@@ -1908,9 +1951,34 @@ class Terminal(Gtk.VBox):
         self.set_font(Pango.FontDescription(font))
         self.custom_font_size = None
 
+    _paned_css_applied = False
+
     def set_font(self, fontdesc):
         """Set the font we want in VTE"""
         self.vte.set_font(fontdesc)
+        # Set paned separator size to exactly 1 character cell — matching
+        # tmux's 1-char separators. Applied once via CSS on first font set.
+        if not Terminal._paned_css_applied:
+            char_w = self.vte.get_char_width()
+            char_h = self.vte.get_char_height()
+            if char_w > 0 and char_h > 0:
+                Terminal._paned_css_applied = True
+                # Use the larger dimension for handle-size (GTK only
+                # supports one value) and use CSS min-width/min-height
+                # on separators for per-direction sizing.
+                css = (
+                    'paned {{'
+                    '  -GtkPaned-handle-size: {w};'
+                    '}}'
+                    'vte-terminal {{'
+                    '  padding: 0;'
+                    '}}'
+                ).format(w=char_w)
+                provider = Gtk.CssProvider()
+                provider.load_from_data(css.encode('utf-8'))
+                Gtk.StyleContext.add_provider_for_screen(
+                    self.get_screen(), provider,
+                    Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 10)
 
     def get_cursor_position(self):
         """Return the coordinates of our cursor"""
@@ -2010,6 +2078,9 @@ class Terminal(Gtk.VBox):
             self.tmux_pane_id = tmux['pane_id']
             if 'width' in tmux and 'height' in tmux:
                 self.vte.set_size(int(tmux['width']), int(tmux['height']))
+            # Move titlebar into the overlay so it takes zero vertical
+            # space. Transparent until mouse hover.
+            self._make_titlebar_overlay()
             from terminatorlib.tmux.controller import TmuxController
             TmuxController().register_terminal(self.tmux_pane_id, self)
 

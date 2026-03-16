@@ -335,9 +335,10 @@ class TmuxController(Borg):
                     alloc = top.get_allocation()
                     px = (alloc.width, alloc.height)
                     if px != self._last_window_pixels:
-                        tmux_dbg('window pixels changed %s -> %s' % (self._last_window_pixels, px))
+                        if self._last_window_pixels is not None:
+                            tmux_dbg('window pixels changed %s -> %s' % (self._last_window_pixels, px))
+                            window_resized = True
                         self._last_window_pixels = px
-                        window_resized = True
                     break
                 except Exception:
                     pass
