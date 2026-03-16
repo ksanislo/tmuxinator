@@ -306,9 +306,13 @@ class TmuxHandlers:
             # Scrollbar is overlaid (Gtk.Overlay) — it doesn't consume
             # layout space, so sb_w is always 0 for pixel calculations.
             sb_w = 0
+            # Titlebar: only counts if packed in the Terminal VBox
+            # (consuming layout space). When overlaid (tmux mode), the
+            # titlebar's parent is the Overlay, not the Terminal VBox.
             tb_h = 0
             if (hasattr(terminal, 'titlebar') and terminal.titlebar
-                    and terminal.titlebar.get_visible()):
+                    and terminal.titlebar.get_visible()
+                    and terminal.titlebar.get_parent() == terminal):
                 tb_h = terminal.titlebar.get_allocation().height
             # VTE internal padding — the space VTE reserves before
             # laying out character cells (typically 1px each side)

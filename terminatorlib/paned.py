@@ -578,41 +578,47 @@ class VPaned(Paned, Gtk.VPaned):
 
     _measured_gap = None  # actual pixel gap, measured after first layout
 
-    def _snap_position(self, widget, pspec):
-        """Snap handle so separator + dead space = 1 character tall.
+    _measured_gap = None  # actual pixel gap, measured after first layout
+    # When True, split dead space evenly above/below handle using
+    # VTE padding-top on child2. When False, all dead space above handle.
+    _center_spacing = False
 
-        Splits the dead space: half above the handle (bottom of child1)
-        and half below (VTE padding-top on child2). Only child2 gets
-        top padding, never the top of the window.
-        """
+    def _snap_position(self, widget, pspec):
+        """Snap handle so child2 starts at a character cell boundary."""
         snap = VPaned._char_snap
         if self._snapping or snap <= 0:
             return
         pos = self.get_position()
         gap = self._measured_gap if self._measured_gap else self.get_handlesize()
-        # half_pad goes below the handle as child2's VTE padding-top
-        half_pad = max((snap - self.get_handlesize()) // 2, 0)
-        # Snap so child2_start + half_pad = N * char_h
+
+        if VPaned._center_spacing:
+            half_pad = max((snap - self.get_handlesize()) // 2, 0)
+        else:
+            half_pad = 0
+
         n = round((pos + gap + half_pad) / snap)
         snapped = max(n * snap - gap - half_pad, 0)
         if snapped != pos:
             self._snapping = True
             self.set_pos(snapped)
             self._snapping = False
-        # Apply padding-top to child2's VTE (not margin — padding is
-        # inside VTE's allocation so VTE draws its bg color there)
-        child2 = self.get_child2()
-        if child2 and half_pad > 0:
-            child2.set_margin_top(0)  # clear any old margin
-            vte = getattr(child2, 'vte', None)
-            if vte and not hasattr(vte, '_below_sep_pad'):
-                vte._below_sep_pad = True
-                from gi.repository import Gtk
-                provider = Gtk.CssProvider()
-                provider.load_from_data(
-                    ('* { padding-top: %dpx; }' % half_pad).encode())
-                vte.get_style_context().add_provider(
-                    provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 20)
+
+        # Apply padding-top to child2's VTE if centering
+        if half_pad > 0:
+            child2 = self.get_child2()
+            if child2:
+                child2.set_margin_top(0)
+                vte = getattr(child2, 'vte', None)
+                if vte and not hasattr(vte, '_below_sep_pad'):
+                    vte._below_sep_pad = True
+                    from gi.repository import Gtk
+                    provider = Gtk.CssProvider()
+                    provider.load_from_data(
+                        ('* { padding-top: %dpx; }' % half_pad).encode())
+                    vte.get_style_context().add_provider(
+                        provider,
+                        Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 20)
+
         # Measure actual gap after layout settles (once)
         if self._measured_gap is None:
             from gi.repository import GLib
