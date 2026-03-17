@@ -26,8 +26,6 @@ class TmuxHandlers:
         self._needs_ratio_retry = False
         self._reconcile_timer = None
         self._capture_after_ratios = False
-        self._output_buffers = {}  # pane_id -> bytes (incomplete escape seq)
-
         # Register handlers
         self.protocol.add_handler('output', self.on_output)
         self.protocol.add_handler('layout-change', self.on_layout_change)
@@ -38,11 +36,7 @@ class TmuxHandlers:
         self.protocol.add_handler('exit', self.on_exit)
 
     def on_output(self, info):
-        """Handle %output: feed data to the terminal's VTE.
-
-        Buffers incomplete escape sequences that may be split across
-        consecutive %output messages due to PTY chunking in tmux.
-        """
+        """Handle %output: feed data to the terminal's VTE."""
         pane_id = info['pane_id']
         data = info['data']
 
@@ -56,92 +50,8 @@ class TmuxHandlers:
         if ALTERNATE_SCREEN_EXIT in data:
             self.controller.pane_alternate[pane_id] = False
 
-        # Prepend any buffered data from a previous incomplete sequence
-        buffered = self._output_buffers.pop(pane_id, None)
-        if buffered:
-            data = buffered + data
-
-        # Check if data ends with an incomplete escape sequence
-        split = self._find_complete_end(data)
-        if split < len(data):
-            # Hold the incomplete tail for the next chunk
-            self._output_buffers[pane_id] = data[split:]
-            data = data[:split]
-
-        if data:
-            GLib.idle_add(self._feed_terminal, terminal, data)
-
-    @staticmethod
-    def _find_complete_end(data):
-        """Find the last position where all escape sequences are complete.
-
-        Scans backwards from the end of data looking for an incomplete
-        escape sequence. Returns the byte offset where complete data ends.
-        If all sequences are complete, returns len(data).
-
-        Handles:
-        - CSI sequences: ESC [ ... <terminator 0x40-0x7E>
-        - OSC sequences: ESC ] ... <ST or BEL>
-        - SS2/SS3: ESC N/O + one char
-        - Standard ESC sequences: ESC + one char (0x40-0x7E)
-        """
-        n = len(data)
-        if n == 0:
-            return 0
-
-        # Scan backwards for the last ESC (0x1b)
-        last_esc = data.rfind(b'\x1b')
-        if last_esc == -1:
-            return n  # no escape sequences at all
-
-        # Check if the sequence starting at last_esc is complete
-        pos = last_esc + 1
-        if pos >= n:
-            # ESC at very end — definitely incomplete
-            return last_esc
-
-        next_byte = data[pos]
-
-        if next_byte == 0x5b:  # '[' — CSI sequence
-            # CSI: ESC [ <params> <intermediates> <terminator>
-            # Terminator is 0x40-0x7E (@ through ~)
-            pos += 1
-            while pos < n:
-                b = data[pos]
-                if 0x40 <= b <= 0x7e:
-                    return n  # complete
-                pos += 1
-            return last_esc  # no terminator found
-
-        elif next_byte == 0x5d:  # ']' — OSC sequence
-            # OSC: ESC ] ... (ST or BEL)
-            # ST = ESC \  or  0x9c
-            # BEL = 0x07
-            pos += 1
-            while pos < n:
-                b = data[pos]
-                if b == 0x07:  # BEL
-                    return n
-                if b == 0x9c:  # ST (single byte)
-                    return n
-                if b == 0x1b and pos + 1 < n and data[pos + 1] == 0x5c:
-                    return n  # ESC \ = ST
-                pos += 1
-            return last_esc  # unterminated OSC
-
-        elif next_byte in (0x4e, 0x4f):  # 'N' or 'O' — SS2/SS3
-            # Need one more character after ESC N/O
-            if pos + 1 < n:
-                return n
-            return last_esc
-
-        elif 0x40 <= next_byte <= 0x7e:
-            # Standard two-byte ESC sequence — complete
-            return n
-
-        else:
-            # Unknown sequence type — pass through
-            return n
+        # Feed to VTE on GTK thread
+        GLib.idle_add(self._feed_terminal, terminal, data)
 
     def _feed_terminal(self, terminal, data):
         """Feed data to terminal VTE widget. Must be called on GTK thread."""
@@ -643,7 +553,7 @@ class TmuxHandlers:
 
             # Capture initial content
             self.protocol.send_command(
-                'capture-pane -J -p -t {} -eC -S - -E -'.format(pane_id),
+                'capture-pane -J -p -t {} -e -S - -E -'.format(pane_id),
                 callback=lambda result, t=new_terminal: self._feed_captured(t, result),
             )
 
@@ -749,7 +659,7 @@ class TmuxHandlers:
         # Capture initial content for all panes
         for pid in get_pane_ids(tree):
             self.protocol.send_command(
-                'capture-pane -J -p -t {} -eC -S - -E -'.format(pid),
+                'capture-pane -J -p -t {} -e -S - -E -'.format(pid),
                 callback=lambda result, p=pid: self._feed_initial_capture(p, result),
             )
         return False
@@ -940,7 +850,7 @@ class TmuxHandlers:
         for window_id, tree in self._layout_trees.items():
             for pane_id in get_pane_ids(tree):
                 self.protocol.send_command(
-                    'capture-pane -J -p -t {} -eC -S - -E -'.format(pane_id),
+                    'capture-pane -J -p -t {} -e -S - -E -'.format(pane_id),
                     callback=lambda result, pid=pane_id: self._feed_initial_capture(pid, result),
                 )
         self._refresh_pane_titles()
