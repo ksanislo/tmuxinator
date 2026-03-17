@@ -25,6 +25,7 @@ class TmuxHandlers:
         self._layout_trees = {}  # window_id -> LayoutNode tree
         self._needs_ratio_retry = False
         self._reconcile_timer = None
+        self._capture_after_ratios = False
 
         # Register handlers
         self.protocol.add_handler('output', self.on_output)
@@ -128,7 +129,6 @@ class TmuxHandlers:
                              new_size[0], new_size[1], elapsed))
 
             # Same panes but resized — update our splits to match
-            self._log_layout_sizes(new_tree)
             GLib.idle_add(self._update_pane_sizes, new_tree)
 
     def _log_layout_sizes(self, node, depth=0):
@@ -178,6 +178,9 @@ class TmuxHandlers:
                 if self.controller._last_client_size is not None:
                     self._snapshot_vte_sizes()
                 self._schedule_reconcile(tree)
+                if self._capture_after_ratios:
+                    self._capture_after_ratios = False
+                    self._send_captures()
         return False
 
     def _apply_ratios_and_finish(self, tree):
@@ -786,8 +789,24 @@ class TmuxHandlers:
         self.controller._initial_layout_ready.set()
 
     def capture_initial_content(self):
-        """Capture and display initial pane content after terminals are registered."""
+        """Capture and display initial pane content after terminals are registered.
+
+        Sends the initial resize command immediately, but defers the
+        actual content capture until after the first _update_pane_sizes
+        applies ratios. This ensures VTEs are at the correct size when
+        captured content is fed, preventing wrapping artifacts.
+        """
         self._send_initial_resize()
+        self._capture_after_ratios = True
+
+    def _send_captures(self):
+        """Send capture-pane commands for all panes.
+
+        Called after ratio application so VTEs are at the correct size
+        when captured content is fed. Used on initial attach and after
+        external resize (e.g. another tmux client changed the layout).
+        """
+        tmux_dbg('sending capture-pane commands (post-ratios)')
         for window_id, tree in self._layout_trees.items():
             for pane_id in get_pane_ids(tree):
                 self.protocol.send_command(
@@ -847,6 +866,8 @@ class TmuxHandlers:
         # window resize (not a split drag) when VTE sizes change
         self.controller._last_window_pixels = (win_w, win_h)
         self.controller._layout_applied_time = time.monotonic()
+        # Recapture content after ratios are applied for the new size
+        self._capture_after_ratios = True
         return False
 
     def _send_initial_resize(self):

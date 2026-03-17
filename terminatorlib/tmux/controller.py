@@ -301,6 +301,9 @@ class TmuxController(Borg):
         and split bar drag (sends relative resize-pane commands).
         """
         pane_id = self.terminal_to_pane.get(terminal, '?')
+        # Ignore resizes before initial layout has been applied
+        if not self._layout_applied_time:
+            return
         tmux_dbg('notify_resize: %s %dx%d applying=%s' % (
             pane_id, cols, rows, self._applying_layout))
         # Don't send resize while we're applying a layout from tmux
@@ -341,9 +344,8 @@ class TmuxController(Borg):
                     alloc = top.get_allocation()
                     px = (alloc.width, alloc.height)
                     if px != self._last_window_pixels:
-                        if self._last_window_pixels is not None:
-                            tmux_dbg('window pixels changed %s -> %s' % (self._last_window_pixels, px))
-                            window_resized = True
+                        tmux_dbg('window pixels changed %s -> %s' % (self._last_window_pixels, px))
+                        window_resized = True
                         self._last_window_pixels = px
                     break
                 except Exception:
