@@ -377,10 +377,8 @@ class PtyTmuxBridge:
         except (IOError, OSError):
             dbg('PtyTmuxBridge: failed to send: %s' % line)
 
-    def stop(self):
-        """Stop reading, restore terminal attributes, and close the fd."""
-        self._alive = False
-        # Restore original terminal attributes before closing
+    def restore_termios(self):
+        """Restore saved terminal attributes on the fd."""
         if self._saved_termios:
             try:
                 import termios
@@ -388,6 +386,10 @@ class PtyTmuxBridge:
             except Exception:
                 pass
             self._saved_termios = None
+
+    def stop(self):
+        """Stop reading and close the fd."""
+        self._alive = False
         try:
             os.close(self._fd)
         except OSError:

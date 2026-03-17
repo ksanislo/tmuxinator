@@ -99,6 +99,7 @@ class TmuxController:
         self._last_client_size = None
         self._last_window_pixels = None
         self._origin_terminal = None  # terminal that ran tmux -CC (PTY takeover)
+        self._saved_termios = None   # original PTY termios to restore on detach
 
     def start(self, session_name, new_session=False):
         """Start the tmux controller.
@@ -158,6 +159,12 @@ class TmuxController:
 
     def stop(self):
         """Detach from tmux and clean up."""
+        # Grab saved termios from bridge before it's closed
+        if self.protocol and hasattr(self.protocol, '_bridge'):
+            bridge = self.protocol._bridge
+            if bridge._saved_termios:
+                self._saved_termios = bridge._saved_termios
+                bridge._saved_termios = None
         if self.protocol:
             self.protocol.stop()
         self.active = False
@@ -183,6 +190,16 @@ class TmuxController:
         saved = getattr(terminal, '_saved_pty', None)
         if saved and hasattr(terminal, 'vte') and terminal.vte:
             dbg('TmuxController: restoring original PTY on origin terminal')
+            # Restore terminal attributes on the original fd before
+            # giving it back to VTE
+            if self._saved_termios:
+                try:
+                    import termios
+                    termios.tcsetattr(saved.get_fd(), termios.TCSANOW,
+                                      self._saved_termios)
+                except Exception:
+                    pass
+                self._saved_termios = None
             terminal.vte.set_pty(saved)
             terminal._saved_pty = None
         return False
