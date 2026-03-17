@@ -356,8 +356,12 @@ class PtyTmuxBridge:
                 buf += data
                 while b'\n' in buf:
                     line, buf = buf.split(b'\n', 1)
-                    # Strip PTY artifacts: \x00 prefix, \r suffix
-                    line = line.lstrip(b'\x00').rstrip(b'\r')
+                    # Strip PTY artifacts:
+                    # - NUL bytes anywhere (PTY inserts these randomly,
+                    #   corrupting octal sequences like \033 when a NUL
+                    #   lands between digits)
+                    # - trailing \r from ONLCR output processing
+                    line = line.replace(b'\x00', b'').rstrip(b'\r')
                     self._line_queue.put(line + b'\n')
         except Exception:
             pass
