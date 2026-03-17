@@ -90,6 +90,7 @@ class TmuxController(Borg):
             self.pane_alternate = {}
             self.window_layouts = {}
             self.window_names = {}
+            self.window_indices = {}
             self._last_pane_sizes = {}
             self._prev_vte_sizes = {}
             self._applying_layout = False
@@ -160,6 +161,7 @@ class TmuxController(Borg):
         self.terminal_to_pane.clear()
         self.pane_alternate.clear()
         self.window_layouts.clear()
+        self.window_indices.clear()
         dbg('TmuxController: stopped')
 
     def _query_initial_state(self):
@@ -187,7 +189,7 @@ class TmuxController(Borg):
         Uses colon separator to avoid brace-related PTY echo issues.
         """
         self.protocol.send_command(
-            'list-windows -F "W:#{window_id}:#{window_name}:#{window_layout}"',
+            'list-windows -F "W:#{window_id}:#{window_index}:#{window_name}:#{window_layout}"',
             callback=self.handlers.on_initial_list_windows,
         )
 
@@ -444,7 +446,7 @@ class TmuxController(Borg):
     def _refresh_layout_state(self):
         """Send list-windows to refresh our layout tree after a resize."""
         self.protocol.send_command(
-            'list-windows -F "W:#{window_id}:#{window_name}:#{window_layout}"',
+            'list-windows -F "W:#{window_id}:#{window_index}:#{window_name}:#{window_layout}"',
             callback=self.handlers.on_initial_list_windows,
         )
 

@@ -15,6 +15,8 @@ from terminatorlib.tmux.layout import (
 ALTERNATE_SCREEN_ENTER = b'\x1b[?1049h'
 ALTERNATE_SCREEN_EXIT = b'\x1b[?1049l'
 
+SHELL_COMMANDS = {'bash', 'zsh', 'fish', 'sh', 'dash', 'csh', 'tcsh', 'ksh'}
+
 
 class TmuxHandlers:
     """Handles tmux notifications and maps them to Terminator operations."""
@@ -581,7 +583,7 @@ class TmuxHandlers:
         dbg('TmuxHandlers: window-add: %s' % window_id)
         # Query the layout of this specific window
         self.protocol.send_command(
-            'list-windows -F "W:#{{window_id}}:#{{window_name}}:#{{window_layout}}" -f "#{{==:#{{window_id}},{wid}}}"'.format(
+            'list-windows -F "W:#{{window_id}}:#{{window_index}}:#{{window_name}}:#{{window_layout}}" -f "#{{==:#{{window_id}},{wid}}}"'.format(
                 wid=window_id),
             callback=lambda result, wid=window_id: self._on_new_window_layout(wid, result),
         )
@@ -596,14 +598,16 @@ class TmuxHandlers:
             if not decoded.startswith('W:@'):
                 continue
             rest = decoded[2:]
-            parts = rest.split(':', 2)
-            if len(parts) < 3:
+            parts = rest.split(':', 3)
+            if len(parts) < 4:
                 continue
             wid = parts[0]
-            window_name = parts[1]
-            layout_string = parts[2]
+            window_index = parts[1]
+            window_name = parts[2]
+            layout_string = parts[3]
             self.controller.window_layouts[window_id] = layout_string
             self.controller.window_names[window_id] = window_name
+            self.controller.window_indices[window_id] = window_index
             try:
                 tree = parse_tmux_layout(layout_string)
                 self._layout_trees[window_id] = tree
@@ -643,14 +647,16 @@ class TmuxHandlers:
         notebook = window.get_child()
         notebook.newtab(widget=root_terminal)
 
-        # Set tab label to tmux window name
+        # Set tab label to index:name
         name = self.controller.window_names.get(window_id)
+        index = self.controller.window_indices.get(window_id, '')
         if name:
+            tab_label = '%s:%s' % (index, name) if index else name
             tab_root = notebook.find_tab_root(root_terminal)
             if tab_root:
                 label = notebook.get_tab_label(tab_root)
                 if label:
-                    label.set_label(name)
+                    label.set_label(tab_label)
 
         # Now build the rest of the split tree
         if not tree.is_leaf:
@@ -755,20 +761,27 @@ class TmuxHandlers:
         tree = self._layout_trees.get(window_id)
         if not tree:
             return False
-        # Find any terminal in this window to locate the notebook
+        # Format as "index:name" to match tmux status bar convention
+        index = self.controller.window_indices.get(window_id, '')
+        tab_label = '%s:%s' % (index, name) if index else name
+        # Store window name and index on all terminals in this window
+        for pane_id in get_pane_ids(tree):
+            t = self.controller.pane_to_terminal.get(pane_id)
+            if t:
+                t._tmux_window_name = name
+                t._tmux_window_index = index
         first_pane_id = self._first_leaf(tree).pane_id
         terminal = self.controller.pane_to_terminal.get(first_pane_id)
         if not terminal:
             return False
-        # Walk up to find the notebook
         widget = terminal.get_parent()
         while widget is not None:
             if hasattr(widget, 'find_tab_root'):
                 tab_root = widget.find_tab_root(terminal)
                 if tab_root:
                     label = widget.get_tab_label(tab_root)
-                    if label:
-                        label.set_label(name)
+                    if label and label.get_label() != tab_label:
+                        label.set_label(tab_label)
                 break
             widget = widget.get_parent()
         return False
@@ -797,20 +810,22 @@ class TmuxHandlers:
             decoded = line.decode('utf-8', errors='replace').strip()
             if not decoded:
                 continue
-            # Format: W:@WINDOW_ID:WINDOW_NAME:LAYOUT_STRING
+            # Format: W:@WINDOW_ID:WINDOW_INDEX:WINDOW_NAME:LAYOUT_STRING
             if not decoded.startswith('W:@'):
                 dbg('TmuxHandlers: skipping invalid line: %s' % decoded)
                 continue
             # Strip the W: prefix, split on colons
-            rest = decoded[2:]  # "@WINDOW_ID:WINDOW_NAME:LAYOUT_STRING"
-            parts = rest.split(':', 2)
-            if len(parts) < 3:
+            rest = decoded[2:]  # "@WINDOW_ID:WINDOW_INDEX:WINDOW_NAME:LAYOUT_STRING"
+            parts = rest.split(':', 3)
+            if len(parts) < 4:
                 continue
             window_id = parts[0]
-            window_name = parts[1]
-            layout_string = parts[2]
+            window_index = parts[1]
+            window_name = parts[2]
+            layout_string = parts[3]
             self.controller.window_layouts[window_id] = layout_string
             self.controller.window_names[window_id] = window_name
+            self.controller.window_indices[window_id] = window_index
             try:
                 tree = parse_tmux_layout(layout_string)
                 self._layout_trees[window_id] = tree
@@ -1025,13 +1040,30 @@ class TmuxHandlers:
         if not self.controller.active:
             return False
         self._refresh_pane_titles()
+        self._refresh_tab_labels()
         return True
 
     def _refresh_tab_labels(self):
-        """Set tab labels from stored tmux window names."""
+        """Set tab labels and window title from stored tmux window names."""
         for window_id, name in self.controller.window_names.items():
             if name:
                 GLib.idle_add(self._update_tab_label, window_id, name)
+        # Set the window title to the session name
+        if self.controller.session_name:
+            GLib.idle_add(self._set_window_title,
+                          'tmux: %s' % self.controller.session_name)
+
+    def _set_window_title(self, title):
+        """Set the Terminator window title. Called on GTK thread."""
+        from terminatorlib.terminator import Terminator
+        try:
+            term = Terminator()
+            window = self._find_tmux_window(term)
+            if window:
+                window.title.force_title(title)
+        except Exception:
+            pass
+        return False
 
     def _refresh_pane_titles(self):
         """Query tmux for pane titles and update terminal titlebars."""
@@ -1044,6 +1076,8 @@ class TmuxHandlers:
         """Handle pane title query response."""
         if result.is_error:
             return
+        import os
+        home = os.environ.get('HOME', '')
         for line in result.output_lines:
             decoded = line.decode('utf-8', errors='replace').strip()
             parts = decoded.split('\t', 3)
@@ -1053,21 +1087,33 @@ class TmuxHandlers:
             terminal = self.controller.pane_to_terminal.get(pane_id)
             if not terminal:
                 continue
-            # Build title: "command: path" or just pane_title if command is a shell
-            home = None
-            try:
-                import os
-                home = os.environ.get('HOME', '')
-            except Exception:
-                pass
+            # Shorten home prefix to ~
             if home and path.startswith(home):
                 path = '~' + path[len(home):]
-            title = '%s: %s' % (command, path)
+            # Get last path component (or ~ for home)
+            if path == '~' or path == '/':
+                short_path = path
+            else:
+                short_path = os.path.basename(path)
+            # Smart title: shells show just dir name, others show "command: dir"
+            if command in SHELL_COMMANDS:
+                title = short_path
+            else:
+                title = '%s: %s' % (command, short_path) if short_path else command
             GLib.idle_add(self._set_terminal_title, terminal, title)
 
     def _set_terminal_title(self, terminal, title):
-        """Set a terminal's titlebar text. Must be called on GTK thread."""
+        """Set a terminal's titlebar text. Must be called on GTK thread.
+
+        Only updates the pane titlebar directly — does NOT emit
+        title-change, which would override the tab label with the
+        pane title instead of the tmux window name.
+        """
         try:
+            old_title = getattr(terminal, '_tmux_title', None)
+            if title == old_title:
+                return False
+            terminal._tmux_title = title
             if hasattr(terminal, 'titlebar'):
                 terminal.titlebar.set_terminal_title(None, title)
         except Exception:

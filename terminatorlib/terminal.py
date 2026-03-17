@@ -1086,6 +1086,14 @@ class Terminal(Gtk.VBox):
 
     def get_window_title(self):
         """Return the window title"""
+        if self.tmux_pane_id is not None:
+            # In tmux mode, VTE never receives title escape sequences.
+            # Return the tmux window name (for tab labels) or pane title.
+            name = (getattr(self, '_tmux_window_name', None)
+                    or getattr(self, '_tmux_title', None)
+                    or self.tmux_pane_id)
+            index = getattr(self, '_tmux_window_index', '')
+            return '%s:%s' % (index, name) if index else name
         return self.vte.get_window_title() or str(self.command)
 
     def on_group_button_press(self, widget, event):
