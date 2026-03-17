@@ -300,8 +300,12 @@ class TmuxController(Borg):
         Distinguishes between window resize (sends refresh-client -C)
         and split bar drag (sends relative resize-pane commands).
         """
+        pane_id = self.terminal_to_pane.get(terminal, '?')
+        tmux_dbg('notify_resize: %s %dx%d applying=%s' % (
+            pane_id, cols, rows, self._applying_layout))
         # Don't send resize while we're applying a layout from tmux
         if self._applying_layout:
+            tmux_dbg('notify_resize: suppressed (applying_layout)')
             return
         # Cancel any pending resize
         if self._resize_timer:
@@ -323,7 +327,9 @@ class TmuxController(Borg):
             # Skip sending commands if a layout was just applied or we just
             # sent a resize command (suppress echo-back from tmux response)
             import time as _time
-            if _time.monotonic() - self._layout_applied_time < 0.3:
+            elapsed = _time.monotonic() - self._layout_applied_time
+            if elapsed < 0.3:
+                tmux_dbg('notify_resize: suppressed (echo-back %.3fs ago)' % elapsed)
                 _snapshot_vte_sizes()
                 return False
 
@@ -343,6 +349,8 @@ class TmuxController(Borg):
                 except Exception:
                     pass
 
+            tmux_dbg('notify_resize: window_resized=%s pane_count=%d' % (
+                window_resized, len(self.terminal_to_pane)))
             if window_resized or len(self.terminal_to_pane) <= 1:
                 # Window resize: send refresh-client -C with total size
                 total_cols, total_rows = self._calculate_client_size()
@@ -402,6 +410,17 @@ class TmuxController(Borg):
                 best_dcols = dcols
                 best_drows = drows
 
+        # Log all pane deltas for debugging
+        for terminal, pane_id in self.terminal_to_pane.items():
+            try:
+                cur = (terminal.vte.get_column_count(), terminal.vte.get_row_count())
+                prev = self._prev_vte_sizes.get(pane_id)
+                if prev and cur != prev:
+                    tmux_dbg('split drag delta: %s prev=%dx%d cur=%dx%d' % (
+                        pane_id, prev[0], prev[1], cur[0], cur[1]))
+            except Exception:
+                pass
+
         if best_pane and best_delta > 0:
             import time as _time
             # Only send the dimension(s) that actually changed
@@ -416,6 +435,8 @@ class TmuxController(Borg):
             # Suppress echo-back from the layout-change response
             self._layout_applied_time = _time.monotonic()
             self._refresh_layout_state()
+        else:
+            tmux_dbg('split drag: no pane changed (best_delta=0)')
 
     def _refresh_layout_state(self):
         """Send list-windows to refresh our layout tree after a resize."""

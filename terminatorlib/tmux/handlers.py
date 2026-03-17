@@ -24,6 +24,7 @@ class TmuxHandlers:
         self.protocol = controller.protocol
         self._layout_trees = {}  # window_id -> LayoutNode tree
         self._needs_ratio_retry = False
+        self._reconcile_timer = None
 
         # Register handlers
         self.protocol.add_handler('output', self.on_output)
@@ -71,6 +72,7 @@ class TmuxHandlers:
 
     def on_layout_change(self, info):
         """Handle %layout-change: sync Terminator splits with tmux layout."""
+        import time, traceback
         window_id = info['window_id']
         layout_string = info['layout_string']
 
@@ -87,6 +89,18 @@ class TmuxHandlers:
         deleted_panes = old_panes - new_panes
         added_panes = new_panes - old_panes
 
+        # Debug: log every layout-change with dimensions and what triggered it
+        old_dims = '%dx%d' % (old_tree.width, old_tree.height) if old_tree else 'none'
+        new_dims = '%dx%d' % (new_tree.width, new_tree.height)
+        client_size = self.controller._last_client_size
+        elapsed = time.monotonic() - self.controller._layout_applied_time \
+            if self.controller._layout_applied_time else float('inf')
+        tmux_dbg('layout-change: %s old=%s new=%s client=%s '
+                 'del=%s add=%s elapsed=%.3fs applying=%s' % (
+                     window_id, old_dims, new_dims, client_size,
+                     deleted_panes or '{}', added_panes or '{}',
+                     elapsed, self.controller._applying_layout))
+
         self._layout_trees[window_id] = new_tree
         self.controller.window_layouts[window_id] = layout_string
 
@@ -95,6 +109,24 @@ class TmuxHandlers:
         elif added_panes:
             GLib.idle_add(self._add_panes, added_panes, new_tree)
         else:
+            # If the layout dimensions changed and we didn't cause it
+            # (unsolicited = another client resized), resize our window
+            # to match — tmux is the authority for external changes.
+            new_size = (new_tree.width, new_tree.height)
+            we_caused_it = elapsed < 1.0
+            if client_size and new_size != client_size and not we_caused_it:
+                tmux_dbg('layout-change: unsolicited size change '
+                         '%dx%d -> %dx%d (elapsed=%.3fs), resizing window' % (
+                             client_size[0], client_size[1],
+                             new_size[0], new_size[1], elapsed))
+                self.controller._last_client_size = new_size
+                GLib.idle_add(self._resize_window_to_tree, new_tree)
+            elif client_size and new_size != client_size:
+                tmux_dbg('layout-change: echo-back size change '
+                         '%dx%d -> %dx%d (elapsed=%.3fs), not resizing' % (
+                             client_size[0], client_size[1],
+                             new_size[0], new_size[1], elapsed))
+
             # Same panes but resized — update our splits to match
             self._log_layout_sizes(new_tree)
             GLib.idle_add(self._update_pane_sizes, new_tree)
@@ -138,6 +170,14 @@ class TmuxHandlers:
             if not deferred:
                 self.controller._applying_layout = False
                 self.controller._layout_applied_time = time.monotonic()
+                # Snapshot VTE sizes so notify_resize won't see the
+                # ratio-driven size change as a "split drag" — but
+                # skip during initial startup (client_size not yet set)
+                # so the first do_resize can detect the delta and send
+                # resize-pane, which triggers fresh content from tmux.
+                if self.controller._last_client_size is not None:
+                    self._snapshot_vte_sizes()
+                self._schedule_reconcile(tree)
         return False
 
     def _apply_ratios_and_finish(self, tree):
@@ -158,7 +198,94 @@ class TmuxHandlers:
             pass
         self.controller._applying_layout = False
         self.controller._layout_applied_time = time.monotonic()
+        if self.controller._last_client_size is not None:
+            self._snapshot_vte_sizes()
+        self._schedule_reconcile(tree)
         return False
+
+    def _snapshot_vte_sizes(self):
+        """Snapshot current VTE sizes into _prev_vte_sizes.
+
+        Called after layout application so notify_resize won't
+        misinterpret ratio-driven VTE changes as split-bar drags.
+        """
+        for t, pid in self.controller.terminal_to_pane.items():
+            try:
+                self.controller._prev_vte_sizes[pid] = (
+                    t.vte.get_column_count(), t.vte.get_row_count())
+            except Exception:
+                pass
+
+    def _schedule_reconcile(self, tree):
+        """Schedule a deferred reconciliation of pane sizes with tmux.
+
+        After ratio application, GTK's pixel rounding may cause VTE sizes
+        to differ from what tmux expects. This sends resize-pane commands
+        to sync tmux with the actual VTE sizes. Runs after the 0.3s
+        suppression window so notify_resize won't interfere.
+        """
+        if self._reconcile_timer:
+            GLib.source_remove(self._reconcile_timer)
+        self._reconcile_timer = GLib.timeout_add(
+            500, self._reconcile_pane_sizes, tree)
+
+    def _reconcile_pane_sizes(self, tree):
+        """Send resize-pane for any pane where VTE size differs from tmux."""
+        import time
+        self._reconcile_timer = None
+        client_size = self.controller._last_client_size
+        tmux_dbg('reconcile: tree=%dx%d client=%s' % (
+            tree.width, tree.height, client_size))
+        if client_size and (tree.width > client_size[0] or tree.height > client_size[1]):
+            tmux_dbg('reconcile: skipping — layout %dx%d exceeds client %dx%d' % (
+                tree.width, tree.height, client_size[0], client_size[1]))
+            return False
+
+        mismatches = []
+        self._collect_mismatches(tree, mismatches)
+        if not mismatches:
+            tmux_dbg('reconcile: all panes match tmux')
+            return False
+        tmux_dbg('reconcile: fixing %d mismatched pane(s):' % len(mismatches))
+        for pane_id, vte_cols, vte_rows, tmux_cols, tmux_rows in mismatches:
+            tmux_dbg('  %s: vte=%dx%d tmux=%dx%d' % (
+                pane_id, vte_cols, vte_rows, tmux_cols, tmux_rows))
+            parts = ['resize-pane -t {}'.format(pane_id)]
+            if vte_cols != tmux_cols:
+                parts.append('-x {}'.format(vte_cols))
+            if vte_rows != tmux_rows:
+                parts.append('-y {}'.format(vte_rows))
+            cmd = ' '.join(parts)
+            tmux_dbg('reconcile: %s' % cmd)
+            self.protocol.send_command(cmd)
+        # Suppress echo-back from layout-change responses
+        self.controller._layout_applied_time = time.monotonic()
+        # Snapshot VTE sizes so subsequent notify_resize has correct baseline
+        for t, pid in self.controller.terminal_to_pane.items():
+            try:
+                self.controller._prev_vte_sizes[pid] = (
+                    t.vte.get_column_count(), t.vte.get_row_count())
+            except Exception:
+                pass
+        self.controller._refresh_layout_state()
+        return False
+
+    def _collect_mismatches(self, node, out):
+        """Collect panes where VTE size differs from tmux's expected size."""
+        if node.is_leaf:
+            terminal = self.controller.pane_to_terminal.get(node.pane_id)
+            if terminal:
+                try:
+                    vte_cols = terminal.vte.get_column_count()
+                    vte_rows = terminal.vte.get_row_count()
+                    if vte_cols != node.width or vte_rows != node.height:
+                        out.append((node.pane_id, vte_cols, vte_rows,
+                                    node.width, node.height))
+                except Exception:
+                    pass
+        else:
+            for child in node.children:
+                self._collect_mismatches(child, out)
 
     def _record_tmux_sizes(self, node):
         """Record tmux's reported pane sizes to prevent resize feedback loops.
@@ -180,75 +307,93 @@ class TmuxHandlers:
         scrollbar width and titlebar height inside each Terminal widget.
         Without this correction, each pane loses ~1 column/row because
         the character-based ratio doesn't reserve space for scrollbars.
+
+        For N-ary splits (3+ children), the GTK widget tree uses nested
+        binary paneds: [A, B, C] becomes Paned1(A, Paned2(B, C)).
+        This method sets ratios on all intermediate paneds, not just the
+        outermost one.
         """
         if node.is_leaf or len(node.children) < 2:
             return
 
-        # Find the terminal for the first leaf of child[0] and child[1]
-        first_leaf_0 = self._first_leaf(node.children[0])
-        first_leaf_1 = self._first_leaf(node.children[1])
-        term_0 = self.controller.pane_to_terminal.get(first_leaf_0.pane_id)
-        term_1 = self.controller.pane_to_terminal.get(first_leaf_1.pane_id)
+        # Set ratios for each binary split in the chain.
+        # For children [c0, c1, c2, ...], we have paneds:
+        #   Paned_0: c0 vs (c1 + c2 + ...)
+        #   Paned_1: c1 vs (c2 + ...)     (intermediate paned)
+        #   etc.
+        orient = node.orientation  # 'h' or 'v'
+        remaining = node.children
 
-        if term_0 and term_1:
-            paned = self._find_common_paned(term_0, term_1)
-            if paned and hasattr(paned, 'ratio'):
-                # Get metrics from an allocated terminal (not 1x1)
+        while len(remaining) >= 2:
+            first_leaf_l = self._first_leaf(remaining[0])
+            first_leaf_r = self._first_leaf(remaining[1])
+            term_l = self.controller.pane_to_terminal.get(first_leaf_l.pane_id)
+            term_r = self.controller.pane_to_terminal.get(first_leaf_r.pane_id)
+
+            if not (term_l and term_r):
+                break
+
+            paned = self._find_common_paned(term_l, term_r)
+            if not (paned and hasattr(paned, 'ratio')):
+                break
+
+            # Get metrics from an allocated terminal
+            char_w, char_h, sb_w, tb_h, vpad_x, vpad_y = \
+                self._get_terminal_metrics(term_l)
+            if char_w <= 0 or char_h <= 0:
                 char_w, char_h, sb_w, tb_h, vpad_x, vpad_y = \
-                    self._get_terminal_metrics(term_0)
-                if char_w <= 0 or char_h <= 0:
-                    char_w, char_h, sb_w, tb_h, vpad_x, vpad_y = \
-                        self._get_terminal_metrics(term_1)
-                if char_w > 0 and char_h > 0:
-                    handle_size = paned.get_handlesize()
-                    paned_len = paned.get_length()
+                    self._get_terminal_metrics(term_r)
+            if char_w <= 0 or char_h <= 0:
+                break
 
-                    if paned_len <= handle_size:
-                        # Paned not allocated yet — skip, will retry
-                        tmux_dbg('ratio SKIPPED: paned not allocated '
-                                 '(len=%d <= handle=%d)' % (
-                                     paned_len, handle_size))
-                        self._needs_ratio_retry = True
-                    else:
-                        orient = node.orientation  # 'h' or 'v'
-                        left_px = self._subtree_px(
-                            node.children[0], orient,
-                            char_w, char_h, sb_w, tb_h,
-                            handle_size, vpad_x, vpad_y)
-                        right_px = sum(
-                            self._subtree_px(c, orient,
-                                             char_w, char_h, sb_w, tb_h,
-                                             handle_size, vpad_x, vpad_y)
-                            for c in node.children[1:])
-                        # Add separators between right-side children
-                        if len(node.children) > 2:
-                            sep = char_w if orient == 'h' else char_h
-                            right_px += (len(node.children) - 2) * sep
+            handle_size = paned.get_handlesize()
+            paned_len = paned.get_length()
 
-                        # Pad the first child so the visual gap
-                        # (padding + handle) = 1 character cell.
-                        # The handle may be smaller than a full char,
-                        # so add the difference as dead space.
-                        char_sep = char_w if orient == 'h' else char_h
-                        if char_sep > handle_size:
-                            left_px += char_sep - handle_size
+            if paned_len <= handle_size:
+                tmux_dbg('ratio SKIPPED: paned not allocated '
+                         '(len=%d <= handle=%d)' % (paned_len, handle_size))
+                self._needs_ratio_retry = True
+                break
 
-                        total_px = left_px + right_px
-                        if total_px > 0:
-                            ratio = left_px / total_px
-                            tmux_dbg('ratio %s-split: left=%dpx right=%dpx '
-                                     'ratio=%.4f old=%.4f paned=%d '
-                                     'char=%dx%d sb=%d tb=%d handle=%d '
-                                     'vte_pad=%dx%d' % (
-                                         orient, left_px, right_px, ratio,
-                                         paned.ratio, paned_len,
-                                         char_w, char_h, sb_w, tb_h,
-                                         handle_size, vpad_x, vpad_y))
-                            if abs(paned.ratio - ratio) > 0.005:
-                                paned.ratio = ratio
-                                paned.set_position_by_ratio()
+            left_px = self._subtree_px(
+                remaining[0], orient,
+                char_w, char_h, sb_w, tb_h,
+                handle_size, vpad_x, vpad_y)
+            right_px = sum(
+                self._subtree_px(c, orient,
+                                 char_w, char_h, sb_w, tb_h,
+                                 handle_size, vpad_x, vpad_y)
+                for c in remaining[1:])
+            # Add separators between right-side children
+            if len(remaining) > 2:
+                sep = char_w if orient == 'h' else char_h
+                right_px += (len(remaining) - 2) * sep
 
-        # Recurse into children
+            # Pad the first child so the visual gap
+            # (padding + handle) = 1 character cell.
+            char_sep = char_w if orient == 'h' else char_h
+            if char_sep > handle_size:
+                left_px += char_sep - handle_size
+
+            total_px = left_px + right_px
+            if total_px > 0:
+                ratio = left_px / total_px
+                tmux_dbg('ratio %s-split: left=%dpx right=%dpx '
+                         'ratio=%.4f old=%.4f paned=%d '
+                         'char=%dx%d sb=%d tb=%d handle=%d '
+                         'vte_pad=%dx%d' % (
+                             orient, left_px, right_px, ratio,
+                             paned.ratio, paned_len,
+                             char_w, char_h, sb_w, tb_h,
+                             handle_size, vpad_x, vpad_y))
+                if abs(paned.ratio - ratio) > 0.005:
+                    paned.ratio = ratio
+                    paned.set_position_by_ratio()
+
+            # Move to the next intermediate paned
+            remaining = remaining[1:]
+
+        # Recurse into children (handle nested splits within each child)
         for child in node.children:
             if not child.is_leaf:
                 self._apply_ratios(child)
@@ -649,6 +794,60 @@ class TmuxHandlers:
                     'capture-pane -J -p -t {} -eC -S - -E -'.format(pane_id),
                     callback=lambda result, pid=pane_id: self._feed_initial_capture(pid, result),
                 )
+
+    def _resize_window_to_tree(self, tree):
+        """Resize our GTK window to match tmux's layout tree dimensions.
+
+        Called on GTK thread when tmux changes the layout size (e.g.
+        another client attached with a different window size).
+        """
+        import time
+        terminals = list(self.controller.terminal_to_pane.keys())
+        if not terminals:
+            return False
+
+        term = None
+        char_w = char_h = sb_w = tb_h = vpad_x = vpad_y = 0
+        for t in terminals:
+            char_w, char_h, sb_w, tb_h, vpad_x, vpad_y = \
+                self._get_terminal_metrics(t)
+            if char_w > 0:
+                term = t
+                break
+        if not term or char_w <= 0:
+            return False
+
+        handle_size = self._get_handle_size(term)
+
+        target_w = self._subtree_px(tree, 'h', char_w, char_h, sb_w, tb_h,
+                                     handle_size, vpad_x, vpad_y)
+        target_h = self._subtree_px(tree, 'v', char_w, char_h, sb_w, tb_h,
+                                     handle_size, vpad_x, vpad_y)
+
+        window = term.get_toplevel()
+        root_paned = self._find_root_paned(term)
+        chrome_w = chrome_h = 0
+        content = window.get_child()
+        if content and root_paned:
+            content_alloc = content.get_allocation()
+            paned_alloc = root_paned.get_allocation()
+            chrome_w = content_alloc.width - paned_alloc.width
+            chrome_h = content_alloc.height - paned_alloc.height
+
+        win_w = int(target_w) + chrome_w
+        win_h = int(target_h) + chrome_h
+
+        tmux_dbg('resize window to tree: %dx%d -> %dx%dpx '
+                 '(chrome=%dx%d char=%dx%d handle=%d)' % (
+                     tree.width, tree.height, win_w, win_h,
+                     chrome_w, chrome_h, char_w, char_h, handle_size))
+
+        window.resize(win_w, win_h)
+        # Update pixel tracking so notify_resize detects this as a
+        # window resize (not a split drag) when VTE sizes change
+        self.controller._last_window_pixels = (win_w, win_h)
+        self.controller._layout_applied_time = time.monotonic()
+        return False
 
     def _send_initial_resize(self):
         """Size our window to match tmux's layout, then tell tmux our size.
