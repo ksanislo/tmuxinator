@@ -374,6 +374,9 @@ class PrefsEditor:
         #Hide on lose focus
         widget = guiget('hideonlosefocuscheck')
         widget.set_active(self.config['hide_on_lose_focus'])
+        #Auto-hide tmux control mode windows
+        widget = guiget('hidetmuxorigincheck')
+        widget.set_active(self.config['hide_tmux_origin'])
         #Show on all workspaces
         widget = guiget('stickycheck')
         widget.set_active(self.config['sticky'])
@@ -909,6 +912,11 @@ class PrefsEditor:
     def on_hideonlosefocuscheck_toggled(self, widget):
         """Hide on lose focus setting changed"""
         self.config['hide_on_lose_focus'] = widget.get_active()
+        self.config.save()
+
+    def on_hidetmuxorigincheck_toggled(self, widget):
+        """Auto-hide tmux control mode windows setting changed"""
+        self.config['hide_tmux_origin'] = widget.get_active()
         self.config.save()
 
     def on_stickycheck_toggled(self, widget):

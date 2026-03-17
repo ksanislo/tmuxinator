@@ -97,6 +97,7 @@ DEFAULTS = {
             'hide_from_taskbar'     : False,
             'always_on_top'         : False,
             'hide_on_lose_focus'    : False,
+            'hide_tmux_origin'      : False,
             'sticky'                : False,
             'use_custom_url_handler': False,
             'custom_url_handler'    : '',

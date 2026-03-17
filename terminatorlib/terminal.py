@@ -642,6 +642,13 @@ class Terminal(Gtk.VBox):
         self._tmux_origin_keypress_id = self.vte.connect(
             'key-press-event', self._on_tmux_origin_keypress)
 
+        # Auto-minimize the origin window if configured
+        if self.config['hide_tmux_origin']:
+            window = self.get_toplevel()
+            if window:
+                self._tmux_origin_window = window
+                window.iconify()
+
         # Start the controller in a thread (it blocks waiting for layout)
         import threading
         def start_tmux():
@@ -671,12 +678,18 @@ class Terminal(Gtk.VBox):
         return True  # swallow all other keys
 
     def _cleanup_tmux_origin(self):
-        """Disconnect the origin screen key handler."""
+        """Disconnect the origin screen key handler and restore window."""
         handler_id = getattr(self, '_tmux_origin_keypress_id', None)
         if handler_id:
             self.vte.disconnect(handler_id)
             self._tmux_origin_keypress_id = None
         self._tmux_origin_ctrl = None
+        # Restore the origin window if it was auto-minimized
+        window = getattr(self, '_tmux_origin_window', None)
+        if window:
+            window.deiconify()
+            window.present()
+            self._tmux_origin_window = None
 
     def _create_tmux_window(self, ctrl, tmux_layout):
         """Create a new Terminator window with tmux layout."""
