@@ -9,7 +9,6 @@ import threading
 from gi.repository import Gdk, GLib
 
 from terminatorlib.util import dbg
-from terminatorlib.tmux import tmux_dbg
 from terminatorlib.tmux.protocol import TmuxProtocol, TmuxProtocolFromPty
 from terminatorlib.tmux.layout import parse_tmux_layout, build_terminator_layout
 
@@ -357,11 +356,11 @@ class TmuxController:
         # Ignore resizes before initial layout has been applied
         if not self._layout_applied_time:
             return
-        tmux_dbg('notify_resize: %s %dx%d applying=%s' % (
+        dbg('notify_resize: %s %dx%d applying=%s' % (
             pane_id, cols, rows, self._applying_layout))
         # Don't send resize while we're applying a layout from tmux
         if self._applying_layout:
-            tmux_dbg('notify_resize: suppressed (applying_layout)')
+            dbg('notify_resize: suppressed (applying_layout)')
             return
         # Cancel any pending resize
         if self._resize_timer:
@@ -385,7 +384,7 @@ class TmuxController:
             import time as _time
             elapsed = _time.monotonic() - self._layout_applied_time
             if elapsed < 0.3:
-                tmux_dbg('notify_resize: suppressed (echo-back %.3fs ago)' % elapsed)
+                dbg('notify_resize: suppressed (echo-back %.3fs ago)' % elapsed)
                 _snapshot_vte_sizes()
                 return False
 
@@ -397,14 +396,14 @@ class TmuxController:
                     alloc = top.get_allocation()
                     px = (alloc.width, alloc.height)
                     if px != self._last_window_pixels:
-                        tmux_dbg('window pixels changed %s -> %s' % (self._last_window_pixels, px))
+                        dbg('window pixels changed %s -> %s' % (self._last_window_pixels, px))
                         window_resized = True
                         self._last_window_pixels = px
                     break
                 except Exception:
                     pass
 
-            tmux_dbg('notify_resize: window_resized=%s pane_count=%d' % (
+            dbg('notify_resize: window_resized=%s pane_count=%d' % (
                 window_resized, len(self.terminal_to_pane)))
             if window_resized or len(self.terminal_to_pane) <= 1:
                 # Window resize: send refresh-client -C with total size
@@ -413,7 +412,7 @@ class TmuxController:
                     size = (total_cols, total_rows)
                     if size != self._last_client_size:
                         self._last_client_size = size
-                        tmux_dbg('sending refresh-client -C %d,%d' % (total_cols, total_rows))
+                        dbg('sending refresh-client -C %d,%d' % (total_cols, total_rows))
                         self.protocol.send_command(
                             'refresh-client -C {},{}'.format(total_cols, total_rows))
                         # Refresh layout state after resize
@@ -471,7 +470,7 @@ class TmuxController:
                 cur = (terminal.vte.get_column_count(), terminal.vte.get_row_count())
                 prev = self._prev_vte_sizes.get(pane_id)
                 if prev and cur != prev:
-                    tmux_dbg('split drag delta: %s prev=%dx%d cur=%dx%d' % (
+                    dbg('split drag delta: %s prev=%dx%d cur=%dx%d' % (
                         pane_id, prev[0], prev[1], cur[0], cur[1]))
             except Exception:
                 pass
@@ -485,13 +484,13 @@ class TmuxController:
             if best_drows > 0:
                 parts.append('-y {}'.format(best_rows))
             cmd = ' '.join(parts)
-            tmux_dbg('split drag: %s' % cmd)
+            dbg('split drag: %s' % cmd)
             self.protocol.send_command(cmd)
             # Suppress echo-back from the layout-change response
             self._layout_applied_time = _time.monotonic()
             self._refresh_layout_state()
         else:
-            tmux_dbg('split drag: no pane changed (best_delta=0)')
+            dbg('split drag: no pane changed (best_delta=0)')
 
     def _refresh_layout_state(self):
         """Send list-windows to refresh our layout tree after a resize."""
@@ -521,7 +520,7 @@ class TmuxController:
         if hasattr(terminal, 'scrollbar') and terminal.scrollbar and terminal.scrollbar.get_visible():
             sb_w = terminal.scrollbar.get_allocation().width
 
-        tmux_dbg('DEBUG %s: cell=%dx%d vte_px=%dx%d vte_chars=%dx%d '
+        dbg('DEBUG %s: cell=%dx%d vte_px=%dx%d vte_chars=%dx%d '
             'term_px=%dx%d titlebar_h=%d scrollbar_w=%d' % (
             pane_id, char_w, char_h,
             vte_alloc.width, vte_alloc.height, vte_cols, vte_rows,
@@ -551,7 +550,7 @@ class TmuxController:
             for tree in self.handlers._layout_trees.values():
                 cols, rows = self._sum_vte_sizes(tree)
                 if cols > 0 and rows > 0:
-                    tmux_dbg('client size: %dx%d (from VTE grid + separators)' % (
+                    dbg('client size: %dx%d (from VTE grid + separators)' % (
                         cols, rows))
                     return cols, rows
 

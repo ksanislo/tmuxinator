@@ -6,7 +6,6 @@ All GTK operations are dispatched via GLib.idle_add() for thread safety.
 from gi.repository import GLib
 
 from terminatorlib.util import dbg
-from terminatorlib.tmux import tmux_dbg
 from terminatorlib.tmux.layout import (
     parse_tmux_layout, get_pane_ids, find_pane_parent, find_pane_node,
 )
@@ -97,7 +96,7 @@ class TmuxHandlers:
         client_size = self.controller._last_client_size
         elapsed = time.monotonic() - self.controller._layout_applied_time \
             if self.controller._layout_applied_time else float('inf')
-        tmux_dbg('layout-change: %s old=%s new=%s client=%s '
+        dbg('layout-change: %s old=%s new=%s client=%s '
                  'del=%s add=%s elapsed=%.3fs applying=%s' % (
                      window_id, old_dims, new_dims, client_size,
                      deleted_panes or '{}', added_panes or '{}',
@@ -117,14 +116,14 @@ class TmuxHandlers:
             new_size = (new_tree.width, new_tree.height)
             we_caused_it = elapsed < 1.0
             if client_size and new_size != client_size and not we_caused_it:
-                tmux_dbg('layout-change: unsolicited size change '
+                dbg('layout-change: unsolicited size change '
                          '%dx%d -> %dx%d (elapsed=%.3fs), resizing window' % (
                              client_size[0], client_size[1],
                              new_size[0], new_size[1], elapsed))
                 self.controller._last_client_size = new_size
                 GLib.idle_add(self._resize_window_to_tree, new_tree)
             elif client_size and new_size != client_size:
-                tmux_dbg('layout-change: echo-back size change '
+                dbg('layout-change: echo-back size change '
                          '%dx%d -> %dx%d (elapsed=%.3fs), not resizing' % (
                              client_size[0], client_size[1],
                              new_size[0], new_size[1], elapsed))
@@ -142,13 +141,13 @@ class TmuxHandlers:
                     vte_rows = terminal.vte.get_row_count()
                     tw_cols, tw_rows = self.controller._pane_size_for_tmux(terminal)
                     match = 'OK' if (tw_cols == node.width and tw_rows == node.height) else 'MISMATCH'
-                    tmux_dbg('  %s%s: tmux=%dx%d widget=%dx%d vte=%dx%d %s' % (
+                    dbg('  %s%s: tmux=%dx%d widget=%dx%d vte=%dx%d %s' % (
                         '  ' * depth, node.pane_id, node.width, node.height,
                         tw_cols, tw_rows, vte_cols, vte_rows, match))
                 except Exception:
                     pass
         else:
-            tmux_dbg('  %s%s split %dx%d:' % ('  ' * depth, node.orientation, node.width, node.height))
+            dbg('  %s%s split %dx%d:' % ('  ' * depth, node.orientation, node.width, node.height))
             for child in node.children:
                 self._log_layout_sizes(child, depth + 1)
 
@@ -164,7 +163,7 @@ class TmuxHandlers:
                 self._needs_ratio_retry = False
                 self._apply_ratios(tree)
                 if self._needs_ratio_retry:
-                    tmux_dbg('retrying ratios in 100ms (unallocated paneds)')
+                    dbg('retrying ratios in 100ms (unallocated paneds)')
                     GLib.timeout_add(100, self._apply_ratios_and_finish, tree)
                     deferred = True
         finally:
@@ -195,7 +194,7 @@ class TmuxHandlers:
         try:
             self._apply_ratios(tree)
             if self._needs_ratio_retry:
-                tmux_dbg('retrying ratios in 100ms (unallocated paneds)')
+                dbg('retrying ratios in 100ms (unallocated paneds)')
                 GLib.timeout_add(100, self._apply_ratios_and_finish, tree)
                 return False  # keep _applying_layout True
         except Exception:
@@ -238,21 +237,21 @@ class TmuxHandlers:
         import time
         self._reconcile_timer = None
         client_size = self.controller._last_client_size
-        tmux_dbg('reconcile: tree=%dx%d client=%s' % (
+        dbg('reconcile: tree=%dx%d client=%s' % (
             tree.width, tree.height, client_size))
         if client_size and (tree.width > client_size[0] or tree.height > client_size[1]):
-            tmux_dbg('reconcile: skipping — layout %dx%d exceeds client %dx%d' % (
+            dbg('reconcile: skipping — layout %dx%d exceeds client %dx%d' % (
                 tree.width, tree.height, client_size[0], client_size[1]))
             return False
 
         mismatches = []
         self._collect_mismatches(tree, mismatches)
         if not mismatches:
-            tmux_dbg('reconcile: all panes match tmux')
+            dbg('reconcile: all panes match tmux')
             return False
-        tmux_dbg('reconcile: fixing %d mismatched pane(s):' % len(mismatches))
+        dbg('reconcile: fixing %d mismatched pane(s):' % len(mismatches))
         for pane_id, vte_cols, vte_rows, tmux_cols, tmux_rows in mismatches:
-            tmux_dbg('  %s: vte=%dx%d tmux=%dx%d' % (
+            dbg('  %s: vte=%dx%d tmux=%dx%d' % (
                 pane_id, vte_cols, vte_rows, tmux_cols, tmux_rows))
             parts = ['resize-pane -t {}'.format(pane_id)]
             if vte_cols != tmux_cols:
@@ -260,7 +259,7 @@ class TmuxHandlers:
             if vte_rows != tmux_rows:
                 parts.append('-y {}'.format(vte_rows))
             cmd = ' '.join(parts)
-            tmux_dbg('reconcile: %s' % cmd)
+            dbg('reconcile: %s' % cmd)
             self.protocol.send_command(cmd)
         # Suppress echo-back from layout-change responses
         self.controller._layout_applied_time = time.monotonic()
@@ -354,7 +353,7 @@ class TmuxHandlers:
             paned_len = paned.get_length()
 
             if paned_len <= handle_size:
-                tmux_dbg('ratio SKIPPED: paned not allocated '
+                dbg('ratio SKIPPED: paned not allocated '
                          '(len=%d <= handle=%d)' % (paned_len, handle_size))
                 self._needs_ratio_retry = True
                 break
@@ -382,7 +381,7 @@ class TmuxHandlers:
             total_px = left_px + right_px
             if total_px > 0:
                 ratio = left_px / total_px
-                tmux_dbg('ratio %s-split: left=%dpx right=%dpx '
+                dbg('ratio %s-split: left=%dpx right=%dpx '
                          'ratio=%.4f old=%.4f paned=%d '
                          'char=%dx%d sb=%d tb=%d handle=%d '
                          'vte_pad=%dx%d' % (
@@ -736,13 +735,13 @@ class TmuxHandlers:
     def on_window_close(self, info):
         """Handle %window-close: close all terminals in that window."""
         window_id = info.get('window_id', '')
-        tmux_dbg('window-close: %s (known trees: %s)' % (
+        dbg('window-close: %s (known trees: %s)' % (
             window_id, list(self._layout_trees.keys())))
         tree = self._layout_trees.pop(window_id, None)
         self.controller.window_layouts.pop(window_id, None)
         if tree:
             pane_ids = get_pane_ids(tree)
-            tmux_dbg('closing panes: %s' % pane_ids)
+            dbg('closing panes: %s' % pane_ids)
             GLib.idle_add(self._close_panes, pane_ids)
         else:
             dbg('TmuxHandlers: no tree found for window %s' % window_id)
@@ -882,7 +881,7 @@ class TmuxHandlers:
         when captured content is fed. Used on initial attach and after
         external resize (e.g. another tmux client changed the layout).
         """
-        tmux_dbg('sending capture-pane commands (post-ratios)')
+        dbg('sending capture-pane commands (post-ratios)')
         for window_id, tree in self._layout_trees.items():
             for pane_id in get_pane_ids(tree):
                 self.protocol.send_command(
@@ -934,7 +933,7 @@ class TmuxHandlers:
         win_w = int(target_w) + chrome_w
         win_h = int(target_h) + chrome_h
 
-        tmux_dbg('resize window to tree: %dx%d -> %dx%dpx '
+        dbg('resize window to tree: %dx%d -> %dx%dpx '
                  '(chrome=%dx%d char=%dx%d handle=%d)' % (
                      tree.width, tree.height, win_w, win_h,
                      chrome_w, chrome_h, char_w, char_h, handle_size))
@@ -974,7 +973,7 @@ class TmuxHandlers:
                 break
         if not term or char_w <= 0:
             # Terminals not realized yet — fall back to tmux dimensions
-            tmux_dbg('initial resize to %dx%d (from tmux layout, '
+            dbg('initial resize to %dx%d (from tmux layout, '
                      'no metrics yet)' % (tree.width, tree.height))
             self.protocol.send_command(
                 'refresh-client -C {},{}'.format(tree.width, tree.height))
@@ -1017,7 +1016,7 @@ class TmuxHandlers:
         win_w = min(target_win_w, max_w)
         win_h = min(target_win_h, max_h)
 
-        tmux_dbg('initial sizing: tmux=%dx%d target_paned=%dx%dpx '
+        dbg('initial sizing: tmux=%dx%d target_paned=%dx%dpx '
                  'chrome=%dx%d target_win=%dx%d screen=%dx%d fits=%s '
                  'char=%dx%d sb=%d tb=%d handle=%d vte_pad=%dx%d' % (
                      tree.width, tree.height, target_w, target_h,
@@ -1030,7 +1029,7 @@ class TmuxHandlers:
 
         if fits:
             # Tell tmux we match its layout
-            tmux_dbg('initial resize to %dx%d (matches tmux)' % (
+            dbg('initial resize to %dx%d (matches tmux)' % (
                 tree.width, tree.height))
             self.protocol.send_command(
                 'refresh-client -C {},{}'.format(tree.width, tree.height))
@@ -1039,7 +1038,7 @@ class TmuxHandlers:
             # to downsize. Back-calculate character dimensions from pixels.
             fit_cols = (win_w - vpad_x - sb_w) // char_w
             fit_rows = (win_h - vpad_y - tb_h) // char_h
-            tmux_dbg('initial resize to %dx%d (screen limited from %dx%d)' % (
+            dbg('initial resize to %dx%d (screen limited from %dx%d)' % (
                 fit_cols, fit_rows, tree.width, tree.height))
             self.protocol.send_command(
                 'refresh-client -C {},{}'.format(fit_cols, fit_rows))
