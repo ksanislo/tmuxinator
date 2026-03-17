@@ -656,12 +656,8 @@ class TmuxHandlers:
         if not tree.is_leaf:
             self._build_split_tree(tree, root_terminal, maker)
 
-        # Capture initial content for all panes
-        for pid in get_pane_ids(tree):
-            self.protocol.send_command(
-                'capture-pane -J -p -t {} -e -S - -E -'.format(pid),
-                callback=lambda result, p=pid: self._feed_initial_capture(p, result),
-            )
+        # Don't capture pane content for new tabs — live %output
+        # will deliver the prompt. Capturing would duplicate it.
         return False
 
     def _first_leaf(self, node):
