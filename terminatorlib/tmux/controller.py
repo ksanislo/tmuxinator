@@ -1,6 +1,6 @@
 """Tmux controller - maps tmux state to Terminator widgets.
 
-Singleton (Borg pattern) that manages the tmux protocol connection,
+One instance per tmux session. Manages the tmux protocol connection,
 terminal registration, key translation, and resize handling.
 """
 
@@ -8,7 +8,6 @@ import threading
 
 from gi.repository import Gdk, GLib
 
-from terminatorlib.borg import Borg
 from terminatorlib.util import dbg
 from terminatorlib.tmux import tmux_dbg
 from terminatorlib.tmux.protocol import TmuxProtocol, TmuxProtocolFromPty
@@ -58,45 +57,47 @@ MOUSE_WHEEL = {
 }
 
 
-class TmuxController(Borg):
-    """Singleton controller bridging tmux and Terminator."""
+_controllers = []  # all active TmuxController instances
 
-    active = None
-    session_name = None
-    protocol = None
-    handlers = None
-    pane_to_terminal = None
-    terminal_to_pane = None
-    pane_alternate = None
-    window_layouts = None
-    _resize_timer = None
-    _initial_layout_ready = None
-    _last_client_size = None
-    _last_pane_sizes = None
-    _last_window_pixels = None
-    _applying_layout = None
-    _layout_applied_time = None
-    _prev_vte_sizes = None
+
+def get_controller(terminal):
+    """Look up the TmuxController that owns a terminal."""
+    ctrl = getattr(terminal, '_tmux_controller', None)
+    if ctrl:
+        return ctrl
+    # Fallback: search all controllers
+    for c in _controllers:
+        if terminal in c.terminal_to_pane:
+            return c
+    return None
+
+
+class TmuxController:
+    """Controller bridging tmux and Terminator.
+
+    One instance per tmux session. Use get_controller(terminal) to
+    look up the controller for a given terminal widget.
+    """
 
     def __init__(self):
-        Borg.__init__(self, self.__class__.__name__)
-        self.prepare_attributes()
-
-    def prepare_attributes(self):
-        if self.pane_to_terminal is None:
-            self.active = False
-            self.pane_to_terminal = {}
-            self.terminal_to_pane = {}
-            self.pane_alternate = {}
-            self.window_layouts = {}
-            self.window_names = {}
-            self.window_indices = {}
-            self._last_pane_sizes = {}
-            self._prev_vte_sizes = {}
-            self._applying_layout = False
-            self._layout_applied_time = 0
-            self._resize_timer = None
-            self._initial_layout_ready = threading.Event()
+        self.active = False
+        self.pane_to_terminal = {}
+        self.terminal_to_pane = {}
+        self.pane_alternate = {}
+        self.window_layouts = {}
+        self.window_names = {}
+        self.window_indices = {}
+        self._last_pane_sizes = {}
+        self._prev_vte_sizes = {}
+        self._applying_layout = False
+        self._layout_applied_time = 0
+        self._resize_timer = None
+        self._initial_layout_ready = threading.Event()
+        self.session_name = None
+        self.protocol = None
+        self.handlers = None
+        self._last_client_size = None
+        self._last_window_pixels = None
 
     def start(self, session_name, new_session=False):
         """Start the tmux controller.
@@ -115,6 +116,7 @@ class TmuxController(Borg):
 
         self.protocol.start()
         self.active = True
+        _controllers.append(self)
         dbg('TmuxController: started for session %s' % session_name)
 
         # Query initial state and wait for it
@@ -141,6 +143,7 @@ class TmuxController(Borg):
 
         self.protocol.start()
         self.active = True
+        _controllers.append(self)
         dbg('TmuxController: started from PTY fd %d' % pty_fd)
 
         # Query initial state and wait for it
@@ -157,11 +160,16 @@ class TmuxController(Borg):
         if self.protocol:
             self.protocol.stop()
         self.active = False
+        # Clear controller reference on terminals
+        for terminal in list(self.terminal_to_pane.keys()):
+            terminal._tmux_controller = None
         self.pane_to_terminal.clear()
         self.terminal_to_pane.clear()
         self.pane_alternate.clear()
         self.window_layouts.clear()
         self.window_indices.clear()
+        if self in _controllers:
+            _controllers.remove(self)
         dbg('TmuxController: stopped')
 
     def _query_initial_state(self):
@@ -197,6 +205,7 @@ class TmuxController(Borg):
         """Register a terminal widget for a tmux pane."""
         self.pane_to_terminal[pane_id] = terminal
         self.terminal_to_pane[terminal] = pane_id
+        terminal._tmux_controller = self
         dbg('TmuxController: registered terminal for pane %s' % pane_id)
 
     def unregister_terminal(self, terminal):
@@ -205,6 +214,7 @@ class TmuxController(Borg):
         if pane_id:
             self.pane_to_terminal.pop(pane_id, None)
             self.pane_alternate.pop(pane_id, None)
+            terminal._tmux_controller = None
             dbg('TmuxController: unregistered terminal for pane %s' % pane_id)
 
     def send_keypress(self, terminal, event):

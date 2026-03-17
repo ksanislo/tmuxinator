@@ -286,13 +286,16 @@ class Window(Container, Gtk.Window):
         if terminals and any(getattr(t, 'tmux_pane_id', None) is not None
                              for t in terminals):
             dbg('tmux window close: detaching instead of closing')
-            from .tmux.controller import TmuxController
-            ctrl = TmuxController()
-            if ctrl.active:
-                # Mark all terminals so close() won't kill tmux panes
-                for t in terminals:
-                    if t.tmux_pane_id is not None:
-                        t._tmux_closing = True
+            # Mark all terminals so close() won't kill tmux panes,
+            # and collect all controllers to stop
+            controllers = set()
+            for t in terminals:
+                if t.tmux_pane_id is not None:
+                    t._tmux_closing = True
+                    ctrl = getattr(t, '_tmux_controller', None)
+                    if ctrl and ctrl.active:
+                        controllers.add(ctrl)
+            for ctrl in controllers:
                 ctrl.stop()
             return False  # allow the window to close
 

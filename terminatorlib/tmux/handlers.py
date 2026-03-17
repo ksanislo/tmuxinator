@@ -65,10 +65,10 @@ class TmuxHandlers:
         return False
 
     def _find_tmux_window(self, terminator):
-        """Find the Terminator window that contains tmux terminals."""
+        """Find the Terminator window that contains this controller's terminals."""
         for window in terminator.windows:
             for terminal in window.get_terminals():
-                if terminal.tmux_pane_id is not None:
+                if terminal in self.controller.terminal_to_pane:
                     return window
         return None
 
