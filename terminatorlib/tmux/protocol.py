@@ -283,12 +283,13 @@ class TmuxProtocol:
         )
         self._reader.start()
 
-    def stop(self):
-        """Detach and stop."""
-        try:
-            self._subprocess.send_raw('detach')
-        except Exception:
-            pass
+    def stop(self, send_detach=True):
+        """Stop the protocol. Sends detach first unless send_detach=False."""
+        if send_detach:
+            try:
+                self._subprocess.send_raw('detach')
+            except Exception:
+                pass
         if self._reader:
             self._reader.stop()
         self._subprocess.stop()
@@ -431,12 +432,13 @@ class TmuxProtocolFromPty:
         )
         self._reader.start()
 
-    def stop(self):
-        """Detach and stop."""
-        try:
-            self._bridge.send_raw('detach')
-        except Exception:
-            pass
+    def stop(self, send_detach=True):
+        """Stop the protocol. Sends detach first unless send_detach=False."""
+        if send_detach:
+            try:
+                self._bridge.send_raw('detach')
+            except Exception:
+                pass
         if self._reader:
             self._reader.stop()
         self._bridge.stop()

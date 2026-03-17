@@ -790,6 +790,20 @@ class TmuxHandlers:
         """Handle %exit: clean up everything."""
         reason = info.get('reason', 'unknown')
         dbg('TmuxHandlers: exit: %s' % reason)
+        # Restore termios immediately on the reader thread, before the
+        # shell resumes and readline saves the wrong terminal state.
+        # Close the duped fd to force the bridge reader to stop instantly
+        # so it can't consume the shell's prompt from the PTY buffer.
+        # The original fd (in _saved_pty) remains open for VTE.
+        proto = self.controller.protocol
+        if hasattr(proto, '_bridge'):
+            proto._bridge.restore_termios()
+            import os
+            try:
+                os.close(proto._bridge._fd)
+            except OSError:
+                pass
+            proto._bridge._alive = False
         GLib.idle_add(self._handle_exit)
 
     def _handle_exit(self):
@@ -802,7 +816,7 @@ class TmuxHandlers:
         for terminal in list(self.controller.pane_to_terminal.values()):
             terminal._tmux_closing = True
             terminal.close()
-        self.controller.stop()
+        self.controller.stop(send_detach=False)
         # If the window still exists and has no children, destroy it
         if window:
             window.hoover()

@@ -578,7 +578,12 @@ class Terminal(Gtk.VBox):
         col, row = self.vte.get_cursor_position()
         if row < 1:
             return
-        start_row = max(0, row - 10)
+        # After a PTY restore, only scan text below the watermark to
+        # avoid re-triggering on stale markers from the previous session
+        watermark = getattr(self, '_tmux_detect_watermark', 0)
+        if row <= watermark:
+            return
+        start_row = max(watermark, row - 10)
         ncols = self.vte.get_column_count()
         text = None
         try:
@@ -625,10 +630,17 @@ class Terminal(Gtk.VBox):
         dummy_pty = Vte.Pty.new_sync(Vte.PtyFlags.DEFAULT)
         self._saved_pty = pty  # prevent GC from closing orig fd
         self.vte.set_pty(dummy_pty)
+        self.vte.feed(b'\r\n\r\n  tmux control mode active\r\n'
+                      b'  Press Ctrl+C to detach\r\n')
         dbg('_takeover_tmux_pty: swapped VTE to dummy PTY')
 
         # Remember which terminal started the takeover so we can restore it
         ctrl._origin_terminal = self
+
+        # Allow Ctrl+C to detach from this screen
+        self._tmux_origin_ctrl = ctrl
+        self._tmux_origin_keypress_id = self.vte.connect(
+            'key-press-event', self._on_tmux_origin_keypress)
 
         # Start the controller in a thread (it blocks waiting for layout)
         import threading
@@ -642,6 +654,29 @@ class Terminal(Gtk.VBox):
         t = threading.Thread(target=start_tmux, daemon=True)
         t.start()
         return False
+
+    def _on_tmux_origin_keypress(self, widget, event):
+        """Handle keypress on the tmux origin screen. Ctrl+C detaches."""
+        ctrl = getattr(self, '_tmux_origin_ctrl', None)
+        if not ctrl or not ctrl.active:
+            return False
+        if (event.get_state() & Gdk.ModifierType.CONTROL_MASK and
+                event.keyval in (Gdk.KEY_c, Gdk.KEY_C)):
+            dbg('tmux origin: Ctrl+C, sending detach')
+            # Just send detach — the normal %exit handler will close
+            # terminals, stop the controller, and restore this PTY.
+            # This keeps the bridge reader alive to consume the response.
+            ctrl.protocol.send_command('detach')
+            return True
+        return True  # swallow all other keys
+
+    def _cleanup_tmux_origin(self):
+        """Disconnect the origin screen key handler."""
+        handler_id = getattr(self, '_tmux_origin_keypress_id', None)
+        if handler_id:
+            self.vte.disconnect(handler_id)
+            self._tmux_origin_keypress_id = None
+        self._tmux_origin_ctrl = None
 
     def _create_tmux_window(self, ctrl, tmux_layout):
         """Create a new Terminator window with tmux layout."""

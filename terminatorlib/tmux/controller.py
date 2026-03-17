@@ -99,7 +99,6 @@ class TmuxController:
         self._last_client_size = None
         self._last_window_pixels = None
         self._origin_terminal = None  # terminal that ran tmux -CC (PTY takeover)
-        self._saved_termios = None   # original PTY termios to restore on detach
 
     def start(self, session_name, new_session=False):
         """Start the tmux controller.
@@ -157,16 +156,18 @@ class TmuxController:
         else:
             dbg('TmuxController: initial layout ready')
 
-    def stop(self):
-        """Detach from tmux and clean up."""
-        # Grab saved termios from bridge before it's closed
+    def stop(self, send_detach=True):
+        """Detach from tmux and clean up.
+
+        send_detach: send detach command to tmux before stopping.
+            False when tmux already exited (would go to the shell).
+        """
+        # Restore termios immediately on the bridge fd before it's closed,
+        # so the shell gets correct terminal state when it resumes
         if self.protocol and hasattr(self.protocol, '_bridge'):
-            bridge = self.protocol._bridge
-            if bridge._saved_termios:
-                self._saved_termios = bridge._saved_termios
-                bridge._saved_termios = None
+            self.protocol._bridge.restore_termios()
         if self.protocol:
-            self.protocol.stop()
+            self.protocol.stop(send_detach=send_detach)
         self.active = False
         # Restore the original PTY on the terminal that ran tmux -CC
         if self._origin_terminal:
@@ -190,18 +191,25 @@ class TmuxController:
         saved = getattr(terminal, '_saved_pty', None)
         if saved and hasattr(terminal, 'vte') and terminal.vte:
             dbg('TmuxController: restoring original PTY on origin terminal')
-            # Restore terminal attributes on the original fd before
-            # giving it back to VTE
-            if self._saved_termios:
-                try:
-                    import termios
-                    termios.tcsetattr(saved.get_fd(), termios.TCSANOW,
-                                      self._saved_termios)
-                except Exception:
-                    pass
-                self._saved_termios = None
+            terminal._cleanup_tmux_origin()
             terminal.vte.set_pty(saved)
             terminal._saved_pty = None
+            # Delay reconnecting tmux detection so VTE can consume any
+            # buffered control mode output (like %exit) first
+            if not getattr(terminal, '_tmux_detect_id', None):
+                GLib.timeout_add(500, self._reconnect_tmux_detect, terminal)
+        return False
+
+    def _reconnect_tmux_detect(self, terminal):
+        """Reconnect tmux detection after VTE has consumed buffered data."""
+        if not hasattr(terminal, 'vte') or not terminal.vte:
+            return False
+        _col, row = terminal.vte.get_cursor_position()
+        terminal._tmux_detect_watermark = row
+        terminal._tmux_detect_id = terminal.vte.connect(
+            'contents-changed',
+            terminal.on_vte_contents_changed_tmux_detect)
+        return False  # don't repeat
         return False
 
     def _query_initial_state(self):
