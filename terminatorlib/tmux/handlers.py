@@ -26,7 +26,6 @@ class TmuxHandlers:
         self._needs_ratio_retry = False
         self._reconcile_timer = None
         self._capture_after_ratios = False
-
         # Register handlers
         self.protocol.add_handler('output', self.on_output)
         self.protocol.add_handler('layout-change', self.on_layout_change)
@@ -582,7 +581,7 @@ class TmuxHandlers:
         dbg('TmuxHandlers: window-add: %s' % window_id)
         # Query the layout of this specific window
         self.protocol.send_command(
-            'list-windows -F "W:#{{window_id}}:#{{window_layout}}" -f "#{{==:#{{window_id}},{wid}}}"'.format(
+            'list-windows -F "W:#{{window_id}}:#{{window_name}}:#{{window_layout}}" -f "#{{==:#{{window_id}},{wid}}}"'.format(
                 wid=window_id),
             callback=lambda result, wid=window_id: self._on_new_window_layout(wid, result),
         )
@@ -597,12 +596,14 @@ class TmuxHandlers:
             if not decoded.startswith('W:@'):
                 continue
             rest = decoded[2:]
-            parts = rest.split(':', 1)
-            if len(parts) < 2:
+            parts = rest.split(':', 2)
+            if len(parts) < 3:
                 continue
             wid = parts[0]
-            layout_string = parts[1]
+            window_name = parts[1]
+            layout_string = parts[2]
             self.controller.window_layouts[window_id] = layout_string
+            self.controller.window_names[window_id] = window_name
             try:
                 tree = parse_tmux_layout(layout_string)
                 self._layout_trees[window_id] = tree
@@ -639,7 +640,17 @@ class TmuxHandlers:
 
         if not window.is_child_notebook():
             Factory().make('Notebook', window=window)
-        window.get_child().newtab(widget=root_terminal)
+        notebook = window.get_child()
+        notebook.newtab(widget=root_terminal)
+
+        # Set tab label to tmux window name
+        name = self.controller.window_names.get(window_id)
+        if name:
+            tab_root = notebook.find_tab_root(root_terminal)
+            if tab_root:
+                label = notebook.get_tab_label(tab_root)
+                if label:
+                    label.set_label(name)
 
         # Now build the rest of the split tree
         if not tree.is_leaf:
@@ -739,6 +750,32 @@ class TmuxHandlers:
         window_id = info.get('window_id', '')
         name = info.get('name', '')
         dbg('TmuxHandlers: window-renamed: %s -> %s' % (window_id, name))
+        self.controller.window_names[window_id] = name
+        if name:
+            GLib.idle_add(self._update_tab_label, window_id, name)
+
+    def _update_tab_label(self, window_id, name):
+        """Update the tab label for a tmux window. Called on GTK thread."""
+        tree = self._layout_trees.get(window_id)
+        if not tree:
+            return False
+        # Find any terminal in this window to locate the notebook
+        first_pane_id = self._first_leaf(tree).pane_id
+        terminal = self.controller.pane_to_terminal.get(first_pane_id)
+        if not terminal:
+            return False
+        # Walk up to find the notebook
+        widget = terminal.get_parent()
+        while widget is not None:
+            if hasattr(widget, 'find_tab_root'):
+                tab_root = widget.find_tab_root(terminal)
+                if tab_root:
+                    label = widget.get_tab_label(tab_root)
+                    if label:
+                        label.set_label(name)
+                break
+            widget = widget.get_parent()
+        return False
 
     def on_exit(self, info):
         """Handle %exit: clean up everything."""
@@ -764,18 +801,20 @@ class TmuxHandlers:
             decoded = line.decode('utf-8', errors='replace').strip()
             if not decoded:
                 continue
-            # Format: W:@WINDOW_ID:LAYOUT_STRING
+            # Format: W:@WINDOW_ID:WINDOW_NAME:LAYOUT_STRING
             if not decoded.startswith('W:@'):
                 dbg('TmuxHandlers: skipping invalid line: %s' % decoded)
                 continue
-            # Strip the W: prefix, split on first : after window_id
-            rest = decoded[2:]  # "@WINDOW_ID:LAYOUT_STRING"
-            parts = rest.split(':', 1)
-            if len(parts) < 2:
+            # Strip the W: prefix, split on colons
+            rest = decoded[2:]  # "@WINDOW_ID:WINDOW_NAME:LAYOUT_STRING"
+            parts = rest.split(':', 2)
+            if len(parts) < 3:
                 continue
             window_id = parts[0]
-            layout_string = parts[1]
+            window_name = parts[1]
+            layout_string = parts[2]
             self.controller.window_layouts[window_id] = layout_string
+            self.controller.window_names[window_id] = window_name
             try:
                 tree = parse_tmux_layout(layout_string)
                 self._layout_trees[window_id] = tree
@@ -798,6 +837,7 @@ class TmuxHandlers:
         """
         self._send_initial_resize()
         self._capture_after_ratios = True
+        self._title_timer = GLib.timeout_add(3000, self._periodic_title_refresh)
 
     def _send_captures(self):
         """Send capture-pane commands for all panes.
@@ -813,6 +853,8 @@ class TmuxHandlers:
                     'capture-pane -J -p -t {} -eC -S - -E -'.format(pane_id),
                     callback=lambda result, pid=pane_id: self._feed_initial_capture(pid, result),
                 )
+        self._refresh_pane_titles()
+        self._refresh_tab_labels()
 
     def _resize_window_to_tree(self, tree):
         """Resize our GTK window to match tmux's layout tree dimensions.
@@ -976,3 +1018,62 @@ class TmuxHandlers:
             raw = b'\r\n'.join(line for line in result.output_lines if line)
             data = unescape_tmux_output(raw)
             GLib.idle_add(self._feed_terminal, terminal, data)
+
+    def _periodic_title_refresh(self):
+        """Periodically refresh pane titles from tmux.
+
+        Tmux intercepts title-setting escape sequences (OSC 0/2) and
+        does not forward them via %output, so VTE never sees them.
+        Polling is the only way to get updated pane titles.
+        """
+        if not self.controller.active:
+            return False
+        self._refresh_pane_titles()
+        return True
+
+    def _refresh_tab_labels(self):
+        """Set tab labels from stored tmux window names."""
+        for window_id, name in self.controller.window_names.items():
+            if name:
+                GLib.idle_add(self._update_tab_label, window_id, name)
+
+    def _refresh_pane_titles(self):
+        """Query tmux for pane titles and update terminal titlebars."""
+        self.protocol.send_command(
+            'list-panes -s -F "#{pane_id}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_title}"',
+            callback=self._on_pane_titles,
+        )
+
+    def _on_pane_titles(self, result):
+        """Handle pane title query response."""
+        if result.is_error:
+            return
+        for line in result.output_lines:
+            decoded = line.decode('utf-8', errors='replace').strip()
+            parts = decoded.split('\t', 3)
+            if len(parts) < 4:
+                continue
+            pane_id, command, path, pane_title = parts
+            terminal = self.controller.pane_to_terminal.get(pane_id)
+            if not terminal:
+                continue
+            # Build title: "command: path" or just pane_title if command is a shell
+            home = None
+            try:
+                import os
+                home = os.environ.get('HOME', '')
+            except Exception:
+                pass
+            if home and path.startswith(home):
+                path = '~' + path[len(home):]
+            title = '%s: %s' % (command, path)
+            GLib.idle_add(self._set_terminal_title, terminal, title)
+
+    def _set_terminal_title(self, terminal, title):
+        """Set a terminal's titlebar text. Must be called on GTK thread."""
+        try:
+            if hasattr(terminal, 'titlebar'):
+                terminal.titlebar.set_terminal_title(None, title)
+        except Exception:
+            pass
+        return False
