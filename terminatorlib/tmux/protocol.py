@@ -321,10 +321,12 @@ class PtyTmuxBridge:
         self._line_queue = queue.Queue()
         self._pipe_thread = None
         self._alive = True
+        self._saved_termios = None
         # Disable echo on the PTY so our commands aren't reflected back
         try:
             import termios
-            attrs = termios.tcgetattr(fd)
+            self._saved_termios = termios.tcgetattr(fd)
+            attrs = list(self._saved_termios)
             attrs[3] = attrs[3] & ~termios.ECHO  # lflags: disable ECHO
             termios.tcsetattr(fd, termios.TCSANOW, attrs)
         except Exception as e:
@@ -376,8 +378,20 @@ class PtyTmuxBridge:
             dbg('PtyTmuxBridge: failed to send: %s' % line)
 
     def stop(self):
-        """Stop reading."""
+        """Stop reading, restore terminal attributes, and close the fd."""
         self._alive = False
+        # Restore original terminal attributes before closing
+        if self._saved_termios:
+            try:
+                import termios
+                termios.tcsetattr(self._fd, termios.TCSANOW, self._saved_termios)
+            except Exception:
+                pass
+            self._saved_termios = None
+        try:
+            os.close(self._fd)
+        except OSError:
+            pass
 
     def is_alive(self) -> bool:
         return self._alive

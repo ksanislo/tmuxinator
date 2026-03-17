@@ -794,7 +794,18 @@ class TmuxHandlers:
 
     def _handle_exit(self):
         """Handle tmux exit on GTK thread."""
+        from terminatorlib.terminator import Terminator
+        term = Terminator()
+        window = self._find_tmux_window(term)
+        # Close any remaining terminals (tmux may not send %window-close
+        # for the last window before %exit)
+        for terminal in list(self.controller.pane_to_terminal.values()):
+            terminal._tmux_closing = True
+            terminal.close()
         self.controller.stop()
+        # If the window still exists and has no children, destroy it
+        if window:
+            window.hoover()
         return False
 
     def on_initial_list_windows(self, result):

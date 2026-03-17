@@ -306,6 +306,8 @@ class Terminal(Gtk.VBox):
                 # kill the tmux pane too
                 if not self._tmux_closing and ctrl.active:
                     ctrl.protocol.send_command('kill-pane -t {}'.format(pane_id))
+            # Release saved PTY reference so the original fd can be closed
+            self._saved_pty = None
         elif self.pid is not None:
             try:
                 dbg('close: killing %d' % self.pid)
@@ -624,6 +626,9 @@ class Terminal(Gtk.VBox):
         self._saved_pty = pty  # prevent GC from closing orig fd
         self.vte.set_pty(dummy_pty)
         dbg('_takeover_tmux_pty: swapped VTE to dummy PTY')
+
+        # Remember which terminal started the takeover so we can restore it
+        ctrl._origin_terminal = self
 
         # Start the controller in a thread (it blocks waiting for layout)
         import threading

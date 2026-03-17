@@ -98,6 +98,7 @@ class TmuxController:
         self.handlers = None
         self._last_client_size = None
         self._last_window_pixels = None
+        self._origin_terminal = None  # terminal that ran tmux -CC (PTY takeover)
 
     def start(self, session_name, new_session=False):
         """Start the tmux controller.
@@ -160,6 +161,9 @@ class TmuxController:
         if self.protocol:
             self.protocol.stop()
         self.active = False
+        # Restore the original PTY on the terminal that ran tmux -CC
+        if self._origin_terminal:
+            GLib.idle_add(self._restore_origin_terminal)
         # Clear controller reference on terminals
         for terminal in list(self.terminal_to_pane.keys()):
             terminal._tmux_controller = None
@@ -171,6 +175,17 @@ class TmuxController:
         if self in _controllers:
             _controllers.remove(self)
         dbg('TmuxController: stopped')
+
+    def _restore_origin_terminal(self):
+        """Restore the original PTY on the terminal that started tmux -CC."""
+        terminal = self._origin_terminal
+        self._origin_terminal = None
+        saved = getattr(terminal, '_saved_pty', None)
+        if saved and hasattr(terminal, 'vte') and terminal.vte:
+            dbg('TmuxController: restoring original PTY on origin terminal')
+            terminal.vte.set_pty(saved)
+            terminal._saved_pty = None
+        return False
 
     def _query_initial_state(self):
         """Query tmux for current windows and panes."""
