@@ -364,6 +364,8 @@ class Terminal(Gtk.VBox):
         """
         if not self.titlebar:
             return
+        if self.titlebar.get_parent() == self._terminalbox_overlay:
+            return
         # Reparent: remove from VBox, add to the overlay
         self.remove(self.titlebar)
         self.titlebar.set_opacity(0.0)
@@ -559,6 +561,7 @@ class Terminal(Gtk.VBox):
         self.cnxids.new(self.vte, 'focus-in-event', self.on_vte_focus_in)
         self.cnxids.new(self.vte, 'focus-out-event', self.on_vte_focus_out)
         self.cnxids.new(self.vte, 'size-allocate', self.deferred_on_vte_size_allocate)
+        self._first_allocate_id = self.vte.connect('size-allocate', self._on_first_allocate)
 
         self.vte.add_events(Gdk.EventMask.ENTER_NOTIFY_MASK)
         self.cnxids.new(self.vte, 'enter_notify_event',
@@ -1106,6 +1109,10 @@ class Terminal(Gtk.VBox):
             self.scrollbar.hide()
         else:
             self.scrollbar.show()
+            # In non-overlay mode, keep scrollbar fully visible
+            if not (self.config['overlay_scrollbar']
+                    or self.tmux_pane_id is not None):
+                self.scrollbar.set_opacity(1.0)
             if self.config['scrollbar_position'] == 'left':
                 self.scrollbar.set_halign(Gtk.Align.START)
             else:
@@ -1113,6 +1120,15 @@ class Terminal(Gtk.VBox):
 
         self.titlebar.update()
         self.vte.queue_draw()
+
+    def _on_first_allocate(self, widget, allocation):
+        """One-shot handler: apply overlay titlebar after widget is ready."""
+        if self._first_allocate_id:
+            self.vte.disconnect(self._first_allocate_id)
+            self._first_allocate_id = None
+        if ((self.config['overlay_titlebar'] or self.tmux_pane_id is not None)
+                and self.titlebar.get_parent() != self._terminalbox_overlay):
+            self._make_titlebar_overlay()
 
     def set_cursor_color(self):
         """Set the cursor color appropriately"""
