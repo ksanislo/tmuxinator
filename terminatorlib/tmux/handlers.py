@@ -646,16 +646,16 @@ class TmuxHandlers:
         notebook = window.get_child()
         notebook.newtab(widget=root_terminal)
 
-        # Set tab label to index:name
-        name = self.controller.window_names.get(window_id)
-        index = self.controller.window_indices.get(window_id, '')
+        # Set initial tab label from cached window name, then refresh
+        # with full formatting (async query to tmux)
+        name = self.controller.window_names.get(window_id, '')
         if name:
-            tab_label = '%s:%s' % (index, name) if index else name
             tab_root = notebook.find_tab_root(root_terminal)
             if tab_root:
                 label = notebook.get_tab_label(tab_root)
                 if label:
-                    label.set_label(tab_label)
+                    label.set_label('[%s]' % name)
+        self._refresh_tab_labels()
 
         # Now build the rest of the split tree
         if not tree.is_leaf:
@@ -747,13 +747,13 @@ class TmuxHandlers:
             dbg('TmuxHandlers: no tree found for window %s' % window_id)
 
     def on_window_renamed(self, info):
-        """Handle %window-renamed: update tab title."""
+        """Handle %window-renamed: refresh tab labels from tmux."""
         window_id = info.get('window_id', '')
         name = info.get('name', '')
         dbg('TmuxHandlers: window-renamed: %s -> %s' % (window_id, name))
         self.controller.window_names[window_id] = name
-        if name:
-            GLib.idle_add(self._update_tab_label, window_id, name)
+        # Refresh with full formatting (command, path, custom title)
+        self._refresh_tab_labels()
 
     def _update_tab_label(self, window_id, tab_label):
         """Update the tab label for a tmux window. Called on GTK thread."""
@@ -1088,16 +1088,15 @@ class TmuxHandlers:
             window_id, index, name, command, path, pane_title = parts
             self.controller.window_names[window_id] = name
             self.controller.window_indices[window_id] = index
-            # Build tab label like pane titlebar: [command:path] custom_title
+            # Build tab label: command:path or custom title (no size)
             if home and path.startswith(home):
                 path = '~' + path[len(home):]
-            base = '[%s:%s]' % (command, path) if path else '[%s]' % command
             has_custom = (pane_title and pane_title != hostname
                           and pane_title != command)
             if has_custom:
-                tab_label = '%s %s' % (base, pane_title)
+                tab_label = pane_title
             else:
-                tab_label = base
+                tab_label = '%s:%s' % (command, path) if path else command
             GLib.idle_add(self._update_tab_label, window_id, tab_label)
         # Set the window title to hostname: session-name
         if self.controller.session_name:
@@ -1111,7 +1110,7 @@ class TmuxHandlers:
         userhost = 'tmux'
         if not result.is_error and result.output_lines:
             userhost = result.output_lines[0].decode('utf-8', errors='replace').strip()
-        title = '[tmux] %s: %s' % (userhost, self.controller.session_name)
+        title = '%s: %s [tmux]' % (userhost, self.controller.session_name)
         GLib.idle_add(self._set_window_title, title)
 
     def _set_window_title(self, title):
@@ -1152,15 +1151,13 @@ class TmuxHandlers:
             # Shorten home prefix to ~
             if home and path.startswith(home):
                 path = '~' + path[len(home):]
-            # Build base label [command:path]
-            base = '[%s:%s]' % (command, path) if path else '[%s]' % command
             # Detect app-set custom title (not tmux's default hostname)
             has_custom = (pane_title and pane_title != hostname
                           and pane_title != command)
             if has_custom:
-                title = '%s %s' % (base, pane_title)
+                title = pane_title
             else:
-                title = base
+                title = '%s:%s' % (command, path) if path else command
             GLib.idle_add(self._set_terminal_title, terminal, title)
 
     def _set_terminal_title(self, terminal, title):
