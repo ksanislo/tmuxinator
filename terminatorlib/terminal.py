@@ -1633,6 +1633,20 @@ class Terminal(Gtk.VBox):
 
     def on_vte_focus(self, _widget):
         """Update our UI when we get focus"""
+        if self.tmux_pane_id is not None:
+            ctrl = self._tmux_controller
+            if ctrl and ctrl.active:
+                # Tell tmux which pane is focused so it updates
+                # the active pane and window name accordingly
+                ctrl.protocol.send_command(
+                    'select-pane -t %s' % self.tmux_pane_id)
+                if ctrl.handlers:
+                    ctrl.handlers._refresh_pane_titles()
+                    ctrl.handlers._refresh_tab_labels()
+            title = getattr(self, '_tmux_title', None)
+            if title:
+                self.titlebar.set_terminal_title(None, title)
+            return
         self.emit('title-change', self.get_window_title())
 
     def on_vte_focus_in(self, _widget, _event):

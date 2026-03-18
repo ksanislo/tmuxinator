@@ -755,15 +755,14 @@ class TmuxHandlers:
         if name:
             GLib.idle_add(self._update_tab_label, window_id, name)
 
-    def _update_tab_label(self, window_id, name):
+    def _update_tab_label(self, window_id, tab_label):
         """Update the tab label for a tmux window. Called on GTK thread."""
         tree = self._layout_trees.get(window_id)
         if not tree:
             return False
-        # Format as "index:name" to match tmux status bar convention
-        index = self.controller.window_indices.get(window_id, '')
-        tab_label = '%s:%s' % (index, name) if index else name
         # Store window name and index on all terminals in this window
+        name = self.controller.window_names.get(window_id, '')
+        index = self.controller.window_indices.get(window_id, '')
         for pane_id in get_pane_ids(tree):
             t = self.controller.pane_to_terminal.get(pane_id)
             if t:
@@ -1068,14 +1067,52 @@ class TmuxHandlers:
         return True
 
     def _refresh_tab_labels(self):
-        """Set tab labels and window title from stored tmux window names."""
-        for window_id, name in self.controller.window_names.items():
-            if name:
-                GLib.idle_add(self._update_tab_label, window_id, name)
-        # Set the window title to the session name
+        """Query tmux for current window names and active pane info."""
+        self.protocol.send_command(
+            'list-windows -F "#{window_id}\t#{window_index}\t#{window_name}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_title}"',
+            callback=self._on_window_names,
+        )
+
+    def _on_window_names(self, result):
+        """Handle window name query response and update tab labels."""
+        if result.is_error:
+            return
+        import os, socket
+        home = os.environ.get('HOME', '')
+        hostname = socket.gethostname()
+        for line in result.output_lines:
+            decoded = line.decode('utf-8', errors='replace').strip()
+            parts = decoded.split('\t', 5)
+            if len(parts) < 6:
+                continue
+            window_id, index, name, command, path, pane_title = parts
+            self.controller.window_names[window_id] = name
+            self.controller.window_indices[window_id] = index
+            # Build tab label like pane titlebar: [command:path] custom_title
+            if home and path.startswith(home):
+                path = '~' + path[len(home):]
+            base = '[%s:%s]' % (command, path) if path else '[%s]' % command
+            has_custom = (pane_title and pane_title != hostname
+                          and pane_title != command)
+            if has_custom:
+                tab_label = '%s %s' % (base, pane_title)
+            else:
+                tab_label = base
+            GLib.idle_add(self._update_tab_label, window_id, tab_label)
+        # Set the window title to hostname: session-name
         if self.controller.session_name:
-            GLib.idle_add(self._set_window_title,
-                          'tmux: %s' % self.controller.session_name)
+            self.protocol.send_command(
+                'display-message -p "#{user}@#{host_short}"',
+                callback=self._on_tmux_hostname,
+            )
+
+    def _on_tmux_hostname(self, result):
+        """Handle hostname query response."""
+        userhost = 'tmux'
+        if not result.is_error and result.output_lines:
+            userhost = result.output_lines[0].decode('utf-8', errors='replace').strip()
+        title = '[tmux] %s: %s' % (userhost, self.controller.session_name)
+        GLib.idle_add(self._set_window_title, title)
 
     def _set_window_title(self, title):
         """Set the Terminator window title. Called on GTK thread."""
@@ -1115,13 +1152,8 @@ class TmuxHandlers:
             # Shorten home prefix to ~
             if home and path.startswith(home):
                 path = '~' + path[len(home):]
-            # Get last path component (or ~ for home)
-            if path == '~' or path == '/':
-                short_path = path
-            else:
-                short_path = os.path.basename(path)
             # Build base label [command:path]
-            base = '[%s:%s]' % (command, short_path) if short_path else '[%s]' % command
+            base = '[%s:%s]' % (command, path) if path else '[%s]' % command
             # Detect app-set custom title (not tmux's default hostname)
             has_custom = (pane_title and pane_title != hostname
                           and pane_title != command)
