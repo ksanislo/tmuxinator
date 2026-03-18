@@ -1100,8 +1100,9 @@ class TmuxHandlers:
         """Handle pane title query response."""
         if result.is_error:
             return
-        import os
+        import os, socket
         home = os.environ.get('HOME', '')
+        hostname = socket.gethostname()
         for line in result.output_lines:
             decoded = line.decode('utf-8', errors='replace').strip()
             parts = decoded.split('\t', 3)
@@ -1119,11 +1120,15 @@ class TmuxHandlers:
                 short_path = path
             else:
                 short_path = os.path.basename(path)
-            # Smart title: shells show just dir name, others show "command: dir"
-            if command in SHELL_COMMANDS:
-                title = short_path
+            # Build base label [command:path]
+            base = '[%s:%s]' % (command, short_path) if short_path else '[%s]' % command
+            # Detect app-set custom title (not tmux's default hostname)
+            has_custom = (pane_title and pane_title != hostname
+                          and pane_title != command)
+            if has_custom:
+                title = '%s %s' % (base, pane_title)
             else:
-                title = '%s: %s' % (command, short_path) if short_path else command
+                title = base
             GLib.idle_add(self._set_terminal_title, terminal, title)
 
     def _set_terminal_title(self, terminal, title):

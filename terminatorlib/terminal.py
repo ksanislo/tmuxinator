@@ -341,11 +341,8 @@ class Terminal(Gtk.VBox):
         self.scrollbar.set_halign(Gtk.Align.END)
         self.scrollbar.set_valign(Gtk.Align.FILL)
 
-        # In overlay mode, show scrollbar only when scrolled back in history
-        self._scrollbar_overlay_mode = False
+        # Show scrollbar only when scrolled back in history
         def _on_adj_changed(*args):
-            if not self._scrollbar_overlay_mode:
-                return
             at_bottom = adj.get_value() >= adj.get_upper() - adj.get_page_size() - 1
             self.scrollbar.set_opacity(0.0 if at_bottom else 0.5)
         adj.connect('value-changed', _on_adj_changed)
@@ -1105,32 +1102,14 @@ class Terminal(Gtk.VBox):
         self.vte.set_scroll_on_keystroke(self.config['scroll_on_keystroke'])
         self.vte.set_scroll_on_output(self.config['scroll_on_output'])
 
-        overlay_scroll = (self.config['overlay_scrollbar']
-                          or self.tmux_pane_id is not None)
         if self.config['scrollbar_position'] in ['disabled', 'hidden']:
             self.scrollbar.hide()
-            self._scrollbar_overlay_mode = False
-        elif overlay_scroll:
-            # Overlay mode: transparent at bottom, fades in when scrolled up
-            self.scrollbar.show()
-            self._scrollbar_overlay_mode = True
-            if self.config['scrollbar_position'] == 'left':
-                self.scrollbar.set_halign(Gtk.Align.START)
-            else:
-                self.scrollbar.set_halign(Gtk.Align.END)
         else:
             self.scrollbar.show()
-            self.scrollbar.set_opacity(1.0)
-            self._scrollbar_overlay_mode = False
             if self.config['scrollbar_position'] == 'left':
                 self.scrollbar.set_halign(Gtk.Align.START)
             else:
                 self.scrollbar.set_halign(Gtk.Align.END)
-
-        # Overlay titlebar if profile option set or tmux mode
-        if self.config['overlay_titlebar'] or self.tmux_pane_id is not None:
-            if self.titlebar.get_parent() != self._terminalbox_overlay:
-                self._make_titlebar_overlay()
 
         self.titlebar.update()
         self.vte.queue_draw()
