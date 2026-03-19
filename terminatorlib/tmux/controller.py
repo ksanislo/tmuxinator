@@ -369,10 +369,12 @@ class TmuxController:
         return True
 
     def notify_resize(self, terminal, cols, rows):
-        """Notify tmux of terminal resize. Debounced to 100ms.
+        """Notify tmux of terminal resize.
 
         Distinguishes between window resize (sends refresh-client -C)
         and split bar drag (sends relative resize-pane commands).
+        Called immediately on each VTE size-allocate — the char-size
+        dedup (size != _last_client_size) prevents redundant commands.
         """
         pane_id = self.terminal_to_pane.get(terminal, '?')
         # Ignore resizes before initial layout has been applied
@@ -384,13 +386,8 @@ class TmuxController:
         if self._applying_layout:
             dbg('notify_resize: suppressed (applying_layout)')
             return
-        # Cancel any pending resize
-        if self._resize_timer:
-            GLib.source_remove(self._resize_timer)
 
         def do_resize():
-            self._resize_timer = None
-
             # Always snapshot current VTE sizes first, so _prev_vte_sizes
             # stays current even when we suppress sending commands
             def _snapshot_vte_sizes():
@@ -438,16 +435,9 @@ class TmuxController:
                 except Exception:
                     pass
 
-            # Skip sending commands if a layout was just applied or we just
-            # sent a resize command (suppress echo-back from tmux response)
-            elapsed = _time.monotonic() - self._layout_applied_time
-            if elapsed < 0.3:
-                dbg('notify_resize: suppressed (echo-back %.3fs ago)' % elapsed)
-                _snapshot_vte_sizes()
-                return False
-
             # Detect if the overall window changed size (vs just a split drag)
             window_resized = False
+            tripwire_hit = False
             for t in self.terminal_to_pane:
                 try:
                     top = t.get_toplevel()
@@ -457,9 +447,26 @@ class TmuxController:
                         dbg('window pixels changed %s -> %s' % (self._last_window_pixels, px))
                         window_resized = True
                         self._last_window_pixels = px
+                    # Check tripwire BEFORE echo-back suppression —
+                    # user actively dragging past the max should never
+                    # be blocked by echo-back timing.
+                    if (self._tripwire_armed and self._tripwire_pixels
+                            and px and (
+                            px[0] >= self._tripwire_pixels[0] or
+                            px[1] >= self._tripwire_pixels[1])):
+                        tripwire_hit = True
                     break
                 except Exception:
                     pass
+
+            # Skip sending commands if a layout was just applied
+            # (suppress echo-back from tmux response) — but NOT
+            # if the tripwire was hit (user actively growing).
+            elapsed = _time.monotonic() - self._layout_applied_time
+            if elapsed < 0.3 and not tripwire_hit:
+                dbg('notify_resize: suppressed (echo-back %.3fs ago)' % elapsed)
+                _snapshot_vte_sizes()
+                return False
 
             # Log all widget layers to understand chrome
             for t in self.terminal_to_pane:
@@ -529,17 +536,7 @@ class TmuxController:
                 total_cols, total_rows = self._calculate_client_size()
                 if total_cols > 0 and total_rows > 0:
                     size = (total_cols, total_rows)
-                    # Check if the window hit the tripwire pixel
-                    # boundary (trying to grow past the known max)
-                    win_px = self._last_window_pixels
-                    if (self._tripwire_armed and self._tripwire_pixels
-                            and win_px and (
-                            win_px[0] >= self._tripwire_pixels[0] or
-                            win_px[1] >= self._tripwire_pixels[1])):
-                        # Lift the constraint — the WM will snap the
-                        # window to the mouse position, and normal
-                        # do_resize flow takes over from here.
-                        # Re-arm after idle to detect future constraints.
+                    if tripwire_hit:
                         dbg('notify_resize: tripwire hit %dx%d > %dx%d, '
                             'lifting constraint' % (
                                 size[0], size[1],
@@ -547,11 +544,8 @@ class TmuxController:
                                 self._tmux_max_chars[1]))
                         self._tripwire_armed = False
                         self._tripwire_pixels = None
-                        # Clear geometry hints but keep _tmux_max_chars
-                        # so _update_max_from_tree won't ratchet down
                         if self.handlers:
                             self.handlers._clear_tmux_max_size()
-                        # Fall through to normal resize path below
                     if size != self._last_client_size:
                         self._last_client_size = size
                         dbg('sending refresh-client -C %d,%d' % (total_cols, total_rows))
@@ -566,7 +560,7 @@ class TmuxController:
             _snapshot_vte_sizes()
             return False
 
-        self._resize_timer = GLib.timeout_add(100, do_resize)
+        do_resize()
 
     def _do_arm_tripwire(self):
         """Set max to the next character boundary so we can detect

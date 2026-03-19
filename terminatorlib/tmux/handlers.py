@@ -1049,46 +1049,41 @@ class TmuxHandlers:
         return (hint_w, hint_h)
 
     def _update_max_from_tree(self, cols, rows):
-        """Update max size constraint from layout tree dimensions.
-        Only raises the ceiling, never lowers it — echo-back responses
-        from our own shrink requests should not reduce the max."""
+        """Update max size constraint from layout tree dimensions."""
         # Skip during initial startup — setting max before the first
         # resize takes effect causes the hint to override the resize.
         if self.controller._last_client_size is None:
             dbg('size_trace update_max: skipped (initial startup)')
             return False
         cur = self.controller._tmux_max_chars
-        if cur and cols <= cur[0] and rows <= cur[1]:
-            # Not bigger — re-arm tripwire in case probe was rejected
-            if not self.controller._tripwire_armed:
+        grew = not cur or cols > cur[0] or rows > cur[1]
+
+        if grew:
+            # Tmux accepted growth — update max but DON'T set
+            # geometry hints so the window can grow freely during
+            # an active drag.  Arm tripwire instantly.
+            dbg('size_trace update_max: grew %dx%d -> %dx%d' % (
+                cur[0] if cur else 0, cur[1] if cur else 0,
+                cols, rows))
+            self.controller._tmux_max_chars = (cols, rows)
+            self.controller._do_arm_tripwire()
+        else:
+            # Didn't grow. If we asked for more than we got,
+            # that's a rejection — constrain and resize down.
+            # Only re-arm after 2s so user must start a fresh drag.
+            sent = self.controller._last_client_size
+            if sent and (cols < sent[0] or rows < sent[1]):
+                dbg('size_trace update_max: rejected '
+                    'sent=%dx%d got=%dx%d' % (
+                    sent[0], sent[1], cols, rows))
+                info = self._chars_to_max_pixels(cols, rows)
+                if info:
+                    self.controller._tmux_max_chars = (cols, rows)
+                    self._set_max_size_pixels(info[0], info[1])
                 self.controller._arm_tripwire_after_idle()
-            return False
-
-        info = self._chars_to_max_pixels(cols, rows)
-        if info is None:
-            return False
-        max_w, max_h, chrome_w, chrome_h, csd_w, csd_h = info
-
-        # Trace window size at max update
-        for t in list(self.controller.terminal_to_pane.keys())[:1]:
-            try:
-                top = t.get_toplevel()
-                wa = top.get_allocation()
-                ws = top.get_size()
-                dbg('size_trace update_max: '
-                    'alloc=%dx%d ws=%dx%d '
-                    'max_chars=%dx%d max_px=%dx%d '
-                    'chrome=%dx%d csd=%dx%d' % (
-                    wa.width, wa.height, ws[0], ws[1],
-                    cols, rows, max_w, max_h,
-                    chrome_w, chrome_h, csd_w, csd_h))
-            except Exception:
-                pass
-
-        self.controller._tmux_max_chars = (cols, rows)
-        self._set_max_size_pixels(max_w, max_h)
-        # Re-arm after idle — don't interrupt an ongoing drag
-        self.controller._arm_tripwire_after_idle()
+            elif not self.controller._tripwire_armed:
+                # Echo-back — arm tripwire instantly
+                self.controller._do_arm_tripwire()
         return False
 
     def _clear_tmux_max_size(self):
