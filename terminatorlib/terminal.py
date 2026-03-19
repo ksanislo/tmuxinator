@@ -1702,15 +1702,19 @@ class Terminal(Gtk.VBox):
     def on_vte_size_allocate(self, widget, allocation):
         self.titlebar.update_terminal_size(self.vte.get_column_count(),
                 self.vte.get_row_count())
-        if self.config['geometry_hinting']:
+        if self.tmux_pane_id is not None and self._tmux_controller:
+            # Tmux mode: always set char-grid increment hints so the
+            # WM snaps to character boundaries during resize.
+            window = self.get_toplevel()
+            window.set_tmux_geometry_hints(self)
+            self._tmux_controller.notify_resize(self,
+                self.vte.get_column_count(), self.vte.get_row_count())
+        elif self.config['geometry_hinting']:
             window = self.get_toplevel()
             window.deferred_set_rough_geometry_hints()
         else:
             window = self.get_toplevel()
             window.disable_geometry_hints()
-        if self.tmux_pane_id is not None and self._tmux_controller:
-            self._tmux_controller.notify_resize(self,
-                self.vte.get_column_count(), self.vte.get_row_count())
 
     def on_vte_notify_enter(self, term, event):
         """Handle the mouse entering this terminal"""

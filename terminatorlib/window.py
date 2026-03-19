@@ -715,7 +715,15 @@ class Window(Container, Gtk.Window):
         caller = traceback.extract_stack(limit=3)[0]
         wa = self.get_allocation()
         ws = self.get_size()
-        if geometry and (flags & Gdk.WindowHints.MAX_SIZE):
+        if geometry and (flags & Gdk.WindowHints.MAX_SIZE) and (flags & Gdk.WindowHints.BASE_SIZE):
+            dbg('size_trace HINT BASE=%dx%d INC=%dx%d MAX=%dx%d '
+                'from %s:%d alloc=%dx%d ws=%dx%d' % (
+                geometry.base_width, geometry.base_height,
+                geometry.width_inc, geometry.height_inc,
+                geometry.max_width, geometry.max_height,
+                caller.filename.split('/')[-1], caller.lineno,
+                wa.width, wa.height, ws[0], ws[1]))
+        elif geometry and (flags & Gdk.WindowHints.MAX_SIZE):
             dbg('size_trace HINT MAX=%dx%d from %s:%d '
                 'alloc=%dx%d ws=%dx%d' % (
                 geometry.max_width, geometry.max_height,
@@ -793,6 +801,55 @@ class Window(Container, Gtk.Window):
         geometry.width_inc = font_width
         geometry.height_inc = font_height
         self.set_geometry_hints(None, geometry, Gdk.WindowHints.BASE_SIZE | Gdk.WindowHints.RESIZE_INC)
+
+    def set_tmux_geometry_hints(self, terminal):
+        """Set BASE_SIZE + RESIZE_INC hints for tmux char-grid snapping.
+
+        Uses the terminal's font metrics for increment and computes
+        the base from the difference between window and VTE content.
+        Also applies MAX_SIZE if a tmux constraint is active.
+        """
+        from gi.repository import Gdk
+        try:
+            char_w = terminal.vte.get_char_width()
+            char_h = terminal.vte.get_char_height()
+            if char_w <= 0 or char_h <= 0:
+                return
+
+            # Geometry hints constrain the ALLOCATION (includes CSD),
+            # not the content size.  Base = CSD + chrome so the
+            # character grid aligns in content space.
+            content = self.get_child()
+            if not content:
+                return
+            wa = self.get_allocation()
+            ws = self.get_size()
+            csd_w = wa.width - ws[0]
+            csd_h = wa.height - ws[1]
+            ca = content.get_allocation()
+            ta = terminal.get_allocation()
+            chrome_w = max(0, ca.width - ta.width)
+            chrome_h = max(0, ca.height - ta.height)
+            base_w = csd_w + chrome_w
+            base_h = csd_h + chrome_h
+
+            geometry = Gdk.Geometry()
+            geometry.base_width = max(0, base_w)
+            geometry.base_height = max(0, base_h)
+            geometry.width_inc = char_w
+            geometry.height_inc = char_h
+
+            flags = Gdk.WindowHints.BASE_SIZE | Gdk.WindowHints.RESIZE_INC
+
+            max_size = getattr(self, '_tmux_max_size', None)
+            if max_size:
+                geometry.max_width = max_size[0]
+                geometry.max_height = max_size[1]
+                flags |= Gdk.WindowHints.MAX_SIZE
+
+            self.set_geometry_hints(None, geometry, flags)
+        except Exception:
+            pass
 
     def disable_geometry_hints(self):
         max_size = getattr(self, '_tmux_max_size', None)
