@@ -399,8 +399,6 @@ class TmuxController:
                         pass
 
             # Check for chrome change (tab bar appeared/disappeared)
-            # BEFORE echo-back suppression — chrome changes need
-            # immediate compensation regardless of suppression state.
             import time as _time
             for t in self.terminal_to_pane:
                 try:
@@ -447,9 +445,7 @@ class TmuxController:
                         dbg('window pixels changed %s -> %s' % (self._last_window_pixels, px))
                         window_resized = True
                         self._last_window_pixels = px
-                    # Check tripwire BEFORE echo-back suppression —
-                    # user actively dragging past the max should never
-                    # be blocked by echo-back timing.
+                    # Check if we hit the tripwire boundary
                     if (self._tripwire_armed and self._tripwire_pixels
                             and px and (
                             px[0] >= self._tripwire_pixels[0] or
@@ -458,15 +454,6 @@ class TmuxController:
                     break
                 except Exception:
                     pass
-
-            # Skip sending commands if a layout was just applied
-            # (suppress echo-back from tmux response) — but NOT
-            # if the tripwire was hit (user actively growing).
-            elapsed = _time.monotonic() - self._layout_applied_time
-            if elapsed < 0.3 and not tripwire_hit:
-                dbg('notify_resize: suppressed (echo-back %.3fs ago)' % elapsed)
-                _snapshot_vte_sizes()
-                return False
 
             # Log all widget layers to understand chrome
             for t in self.terminal_to_pane:
