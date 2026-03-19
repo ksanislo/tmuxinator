@@ -251,6 +251,11 @@ class TmuxController:
         self.pane_to_terminal[pane_id] = terminal
         self.terminal_to_pane[terminal] = pane_id
         terminal._tmux_controller = self
+        # Tmux controls content and sends fresh output on resize,
+        # so disable VTE's own text rewrapping to avoid flicker
+        # (lines briefly doubling from wrap before new content arrives).
+        if hasattr(terminal, 'vte') and terminal.vte:
+            terminal.vte.set_rewrap_on_resize(False)
         dbg('TmuxController: registered terminal for pane %s' % pane_id)
 
         # Replay any %output that arrived before registration
