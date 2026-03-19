@@ -145,7 +145,6 @@ class TmuxHandlers:
                          '%dx%d -> %dx%d (elapsed=%.3fs), resizing window' % (
                              client_size[0], client_size[1],
                              new_size[0], new_size[1], elapsed))
-                self.controller._last_client_size = new_size
                 # Reset max so _update_max_from_tree can lower it
                 self.controller._tmux_max_chars = None
                 GLib.idle_add(self._resize_window_to_tree, new_tree)
@@ -158,16 +157,13 @@ class TmuxHandlers:
                              '(elapsed=%.3fs), re-constraining' % (
                                  client_size[0], client_size[1],
                                  new_size[0], new_size[1], elapsed))
-                    # Reset max so _update_max_from_tree can set it
                     self.controller._tmux_max_chars = None
-                    self.controller._last_client_size = new_size
                     GLib.idle_add(self._resize_window_to_tree, new_tree)
                 else:
                     dbg('layout-change: echo-back size change '
                              '%dx%d -> %dx%d (elapsed=%.3fs)' % (
                                  client_size[0], client_size[1],
                                  new_size[0], new_size[1], elapsed))
-                    self.controller._last_client_size = new_size
 
             # Update max size from tree dimensions (free, no query)
             GLib.idle_add(self._update_max_from_tree,
