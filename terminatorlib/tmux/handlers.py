@@ -169,6 +169,11 @@ class TmuxHandlers:
                                  new_size[0], new_size[1], elapsed))
                     self.controller._last_client_size = new_size
 
+            # Snap window to exact pixel alignment for confirmed size.
+            # During a drag the user's mouse overrides this instantly;
+            # after the drag stops the last snap sticks.
+            GLib.idle_add(self._resize_window_to_tree, new_tree)
+
             # Update max size from tree dimensions (free, no query)
             GLib.idle_add(self._update_max_from_tree,
                           new_tree.width, new_tree.height)
