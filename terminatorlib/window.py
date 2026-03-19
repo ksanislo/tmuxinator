@@ -696,6 +696,45 @@ class Window(Container, Gtk.Window):
         self.pending_set_rough_geometry_hint = False
         self.set_rough_geometry_hints()
 
+    def resize(self, width, height):
+        """Override to trace every resize call."""
+        import traceback
+        caller = traceback.extract_stack(limit=3)[0]
+        wa = self.get_allocation()
+        ws = self.get_size()
+        dbg('size_trace RESIZE %dx%d from %s:%d '
+            'alloc=%dx%d ws=%dx%d' % (
+            width, height,
+            caller.filename.split('/')[-1], caller.lineno,
+            wa.width, wa.height, ws[0], ws[1]))
+        Gtk.Window.resize(self, width, height)
+
+    def set_geometry_hints(self, widget, geometry, flags):
+        """Override to trace every geometry hint change."""
+        import traceback
+        caller = traceback.extract_stack(limit=3)[0]
+        wa = self.get_allocation()
+        ws = self.get_size()
+        if geometry and (flags & Gdk.WindowHints.MAX_SIZE):
+            dbg('size_trace HINT MAX=%dx%d from %s:%d '
+                'alloc=%dx%d ws=%dx%d' % (
+                geometry.max_width, geometry.max_height,
+                caller.filename.split('/')[-1], caller.lineno,
+                wa.width, wa.height, ws[0], ws[1]))
+        elif geometry and (flags & Gdk.WindowHints.BASE_SIZE):
+            dbg('size_trace HINT BASE=%dx%d INC=%dx%d '
+                'from %s:%d alloc=%dx%d ws=%dx%d' % (
+                geometry.base_width, geometry.base_height,
+                geometry.width_inc, geometry.height_inc,
+                caller.filename.split('/')[-1], caller.lineno,
+                wa.width, wa.height, ws[0], ws[1]))
+        elif geometry is None:
+            dbg('size_trace HINT CLEAR from %s:%d '
+                'alloc=%dx%d ws=%dx%d' % (
+                caller.filename.split('/')[-1], caller.lineno,
+                wa.width, wa.height, ws[0], ws[1]))
+        Gtk.Window.set_geometry_hints(self, widget, geometry, flags)
+
     def set_rough_geometry_hints(self):
         """Walk all the terminals along the top and left edges to fake up how
         many columns/rows we sort of have"""

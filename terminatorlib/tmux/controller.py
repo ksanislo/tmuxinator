@@ -101,6 +101,7 @@ class TmuxController:
         self.handlers = None
         self._last_client_size = None
         self._last_window_pixels = None
+        self._last_chrome = None  # (w, h) content-term chrome
         self._origin_terminal = None  # terminal that ran tmux -CC (PTY takeover)
 
     def start(self, session_name, new_session=False):
@@ -383,9 +384,45 @@ class TmuxController:
                     except Exception:
                         pass
 
+            # Check for chrome change (tab bar appeared/disappeared)
+            # BEFORE echo-back suppression — chrome changes need
+            # immediate compensation regardless of suppression state.
+            import time as _time
+            for t in self.terminal_to_pane:
+                try:
+                    top = t.get_toplevel()
+                    content = top.get_child()
+                    if content and self._last_chrome is not None:
+                        ca = content.get_allocation()
+                        ta = t.get_allocation()
+                        chrome = (ca.width - ta.width,
+                                  ca.height - ta.height)
+                        if chrome != self._last_chrome:
+                            delta_w = chrome[0] - self._last_chrome[0]
+                            delta_h = chrome[1] - self._last_chrome[1]
+                            ws = top.get_size()
+                            new_w = ws[0] + delta_w
+                            new_h = ws[1] + delta_h
+                            dbg('size_trace chrome_changed: '
+                                '%dx%d -> %dx%d delta=%dx%d '
+                                'resize=%dx%d' % (
+                                self._last_chrome[0],
+                                self._last_chrome[1],
+                                chrome[0], chrome[1],
+                                delta_w, delta_h,
+                                new_w, new_h))
+                            top.resize(new_w, new_h)
+                            self._last_chrome = chrome
+                            self._layout_applied_time = \
+                                _time.monotonic()
+                            _snapshot_vte_sizes()
+                            return False
+                    break
+                except Exception:
+                    pass
+
             # Skip sending commands if a layout was just applied or we just
             # sent a resize command (suppress echo-back from tmux response)
-            import time as _time
             elapsed = _time.monotonic() - self._layout_applied_time
             if elapsed < 0.3:
                 dbg('notify_resize: suppressed (echo-back %.3fs ago)' % elapsed)
