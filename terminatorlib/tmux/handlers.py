@@ -463,14 +463,21 @@ class TmuxHandlers:
         """Get char/scrollbar/titlebar/VTE-padding pixel sizes from a terminal.
 
         Returns (char_w, char_h, sb_w, tb_h, vte_pad_x, vte_pad_y).
+        char_w and char_h are fractional (Pango-based) for accuracy —
+        get_char_width()/get_char_height() truncate to int, and the
+        error accumulates over many characters.
         Returns all zeros if the terminal is not yet allocated.
         """
         try:
-            char_w = terminal.vte.get_char_width()
-            char_h = terminal.vte.get_char_height()
+            int_cw = terminal.vte.get_char_width()
+            int_ch = terminal.vte.get_char_height()
             alloc = terminal.vte.get_allocation()
-            if char_w <= 0 or char_h <= 0 or alloc.width <= char_w or alloc.height <= char_h:
+            if int_cw <= 0 or int_ch <= 0 \
+                    or alloc.width <= int_cw \
+                    or alloc.height <= int_ch:
                 return 0, 0, 0, 0, 0, 0
+            char_w = int_cw
+            char_h = int_ch
             # Scrollbar is overlaid (Gtk.Overlay) — it doesn't consume
             # layout space, so sb_w is always 0 for pixel calculations.
             sb_w = 0
@@ -482,9 +489,6 @@ class TmuxHandlers:
                     and terminal.titlebar.get_visible()
                     and terminal.titlebar.get_parent() == terminal):
                 tb_h = terminal.titlebar.get_allocation().height
-            # VTE padding is zeroed globally via CSS (vte-terminal { padding: 0 }).
-            # Don't query style context — per-VTE centering CSS overrides
-            # would be read back and corrupt sizing calculations.
             vte_pad_x = 0
             vte_pad_y = 0
             return char_w, char_h, sb_w, tb_h, vte_pad_x, vte_pad_y
@@ -975,19 +979,21 @@ class TmuxHandlers:
         if not terminals:
             return (max_w, max_h)
         window = terminals[0].get_toplevel()
-        window._tmux_max_size = (max_w, max_h)
         # CSD = difference between outer allocation and content size
         alloc = window.get_allocation()
         ws = window.get_size()
         csd_w = max(0, alloc.width - ws[0])
         csd_h = max(0, alloc.height - ws[1])
+        hint_w = max_w + csd_w
+        hint_h = max_h + csd_h
+        # Store in allocation space so window.py re-applies correctly
+        # as geometry hints (which constrain allocation, not content)
+        window._tmux_max_size = (hint_w, hint_h)
         # If CSD not yet known (window just created), skip —
         # setting hints without CSD makes the max too tight.
         # The tripwire will set correct hints once CSD is available.
         if csd_w == 0 and csd_h == 0:
             return (max_w, max_h)
-        hint_w = max_w + csd_w
-        hint_h = max_h + csd_h
         from gi.repository import Gdk
         geometry = Gdk.Geometry()
         geometry.max_width = hint_w
@@ -1125,20 +1131,70 @@ class TmuxHandlers:
 
         handle_size = self._get_handle_size(term)
 
-        # Compute pixel dimensions for tmux's layout (content area)
-        target_w = self._subtree_px(tree, 'h', char_w, char_h, sb_w, tb_h,
-                                     handle_size, vpad_x, vpad_y)
-        target_h = self._subtree_px(tree, 'v', char_w, char_h, sb_w, tb_h,
-                                     handle_size, vpad_x, vpad_y)
+        dbg('initial_resize step1: metrics '
+            'char=%dx%d sb=%d tb=%d handle=%d vpad=%dx%d' % (
+            char_w, char_h, sb_w, tb_h,
+            handle_size, vpad_x, vpad_y))
 
-        # Chrome = everything between window content size and VTE area
-        # Use get_size() - vte_alloc, NOT content_alloc - paned_alloc
-        # which misses the tab bar when there's no Paned widget.
+        # Compute pixel dimensions for tmux's layout (content area)
+        target_w = self._subtree_px(tree, 'h', char_w, char_h,
+                                     sb_w, tb_h, handle_size,
+                                     vpad_x, vpad_y)
+        target_h = self._subtree_px(tree, 'v', char_w, char_h,
+                                     sb_w, tb_h, handle_size,
+                                     vpad_x, vpad_y)
+
+        dbg('initial_resize step2: subtree_px '
+            'tmux=%dx%d target=%.1fx%.1f' % (
+            tree.width, tree.height, target_w, target_h))
+
+        # Measure every layer of the window
         window = term.get_toplevel()
+        wa = window.get_allocation()
         ws = window.get_size()
+        content = window.get_child()
+        ca = content.get_allocation() if content else None
+        ta = term.get_allocation()
         vte_alloc = term.vte.get_allocation()
-        chrome_w = ws[0] - vte_alloc.width
-        chrome_h = ws[1] - vte_alloc.height
+        vc = term.vte.get_column_count()
+        vr = term.vte.get_row_count()
+
+        dbg('initial_resize step3: layers '
+            'win_alloc=%dx%d win_size=%dx%d '
+            'content=%s term=%dx%d '
+            'vte=%dx%d vte_chars=%dx%d' % (
+            wa.width, wa.height, ws[0], ws[1],
+            '%dx%d' % (ca.width, ca.height)
+                if ca else 'None',
+            ta.width, ta.height,
+            vte_alloc.width, vte_alloc.height,
+            vc, vr))
+
+        # Chrome using different reference points
+        csd_w = wa.width - ws[0]
+        csd_h = wa.height - ws[1]
+        chrome_ws_vte = (ws[0] - vte_alloc.width,
+                         ws[1] - vte_alloc.height)
+        chrome_alloc_vte = (wa.width - vte_alloc.width,
+                            wa.height - vte_alloc.height)
+        chrome_content_term = (
+            (ca.width - ta.width, ca.height - ta.height)
+            if ca else (0, 0))
+
+        dbg('initial_resize step4: chrome options '
+            'csd=%dx%d '
+            'ws-vte=%dx%d '
+            'alloc-vte=%dx%d '
+            'content-term=%dx%d' % (
+            csd_w, csd_h,
+            chrome_ws_vte[0], chrome_ws_vte[1],
+            chrome_alloc_vte[0], chrome_alloc_vte[1],
+            chrome_content_term[0], chrome_content_term[1]))
+
+        # Use alloc-vte as chrome (includes CSD, since
+        # window.resize operates on allocation)
+        chrome_w = chrome_alloc_vte[0]
+        chrome_h = chrome_alloc_vte[1]
 
         # Get screen limits
         from gi.repository import Gdk
@@ -1149,23 +1205,36 @@ class TmuxHandlers:
         max_w = mon_geom.width
         max_h = mon_geom.height
 
-        # Target: paned content + chrome between content child and paned
-        target_win_w = int(target_w) + chrome_w
-        target_win_h = int(target_h) + chrome_h
+        # Target: paned content + chrome + 1 char buffer.
+        # get_char_width() truncates fractional px; the error
+        # accumulates over cols (e.g. 0.05 * 160 = 8px).
+        target_win_w = int(target_w) + chrome_w + char_w
+        target_win_h = int(target_h) + chrome_h + char_h
+
         fits = target_win_w <= max_w and target_win_h <= max_h
         win_w = min(target_win_w, max_w)
         win_h = min(target_win_h, max_h)
 
-        dbg('initial sizing: tmux=%dx%d target_paned=%dx%dpx '
-                 'chrome=%dx%d target_win=%dx%d screen=%dx%d fits=%s '
-                 'char=%dx%d sb=%d tb=%d handle=%d vte_pad=%dx%d' % (
-                     tree.width, tree.height, target_w, target_h,
-                     chrome_w, chrome_h, win_w, win_h,
-                     max_w, max_h, fits,
-                     char_w, char_h, sb_w, tb_h,
-                     handle_size, vpad_x, vpad_y))
+        dbg('initial_resize step5: final '
+            'target_win=%dx%d resize=%dx%d '
+            'screen=%dx%d fits=%s' % (
+            target_win_w, target_win_h,
+            win_w, win_h,
+            max_w, max_h, fits))
 
         window.resize(win_w, win_h)
+
+        # Check what happened after resize
+        wa2 = window.get_allocation()
+        ws2 = window.get_size()
+        va2 = term.vte.get_allocation()
+        vc2 = term.vte.get_column_count()
+        vr2 = term.vte.get_row_count()
+        dbg('initial_resize step6: after resize '
+            'win_alloc=%dx%d win_size=%dx%d '
+            'vte=%dx%d vte_chars=%dx%d' % (
+            wa2.width, wa2.height, ws2[0], ws2[1],
+            va2.width, va2.height, vc2, vr2))
 
         if fits:
             # Tell tmux we match its layout

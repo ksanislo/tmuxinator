@@ -363,10 +363,38 @@ class Terminator(Borg):
             window, terminal = self.new_window()
             if 'tmux_size' in layout[windef]:
                 size = layout[windef]['tmux_size']
-                # Rough estimate — real sizing happens in
-                # handlers._send_initial_resize once VTEs are realized
-                # and we can measure actual char/scrollbar/titlebar sizes.
-                window.resize(int(size[0]) * 10, int(size[1]) * 20)
+                cols, rows = int(size[0]), int(size[1])
+                cw = terminal.vte.get_char_width() or 10
+                ch = terminal.vte.get_char_height() or 18
+                wa = window.get_allocation()
+                ws = window.get_size()
+                va = terminal.vte.get_allocation()
+                vc = terminal.vte.get_column_count()
+                vr = terminal.vte.get_row_count()
+                dbg('rough resize: tmux=%dx%d '
+                    'char=%dx%d vte_chars=%dx%d '
+                    'win_alloc=%dx%d win_size=%dx%d '
+                    'vte_alloc=%dx%d' % (
+                    cols, rows, cw, ch, vc, vr,
+                    wa.width, wa.height,
+                    ws[0], ws[1],
+                    va.width, va.height))
+                overhead_w = max(wa.width - va.width, 54)
+                overhead_h = max(wa.height - va.height, 54)
+                resize_w = cols * cw + cw + overhead_w
+                resize_h = rows * ch + ch + overhead_h
+                dbg('rough resize: overhead=%dx%d '
+                    'resize=%dx%d' % (
+                    overhead_w, overhead_h,
+                    resize_w, resize_h))
+                window.resize(resize_w, resize_h)
+                # Log state after resize call
+                wa2 = window.get_allocation()
+                ws2 = window.get_size()
+                dbg('rough resize: after resize '
+                    'win_alloc=%dx%d win_size=%dx%d' % (
+                    wa2.width, wa2.height,
+                    ws2[0], ws2[1]))
             window.create_layout(layout[windef])
 
         self.layoutname = 'tmux'

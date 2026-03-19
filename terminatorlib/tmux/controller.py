@@ -407,7 +407,7 @@ class TmuxController:
                 except Exception:
                     pass
 
-            # Log current window state every do_resize
+            # Log all widget layers to understand chrome
             for t in self.terminal_to_pane:
                 try:
                     top = t.get_toplevel()
@@ -416,10 +416,55 @@ class TmuxController:
                     va = t.vte.get_allocation()
                     vc = t.vte.get_column_count()
                     vr = t.vte.get_row_count()
-                    dbg('do_resize state: win_size=%dx%d win_alloc=%dx%d '
-                        'vte=%dx%d vte_chars=%dx%d' % (
+                    ta = t.get_allocation()
+                    sf = top.get_scale_factor()
+                    content = top.get_child()
+                    ca = content.get_allocation() if content else None
+                    rp = self.handlers._find_root_paned(t) \
+                        if self.handlers else None
+                    pa = rp.get_allocation() if rp else None
+                    cw = t.vte.get_char_width()
+                    ch = t.vte.get_char_height()
+                    dbg('do_resize layers: '
+                        'scale=%d ws=%dx%d alloc=%dx%d '
+                        'content=%s paned=%s '
+                        'term=%dx%d vte=%dx%d '
+                        'chars=%dx%d char_px=%dx%d' % (
+                        sf,
                         ws[0], ws[1], wa.width, wa.height,
-                        va.width, va.height, vc, vr))
+                        '%dx%d' % (ca.width, ca.height)
+                            if ca else 'None',
+                        '%dx%d' % (pa.width, pa.height)
+                            if pa else 'None',
+                        ta.width, ta.height,
+                        va.width, va.height,
+                        vc, vr, cw, ch))
+                    if ca and pa:
+                        dbg('do_resize chrome: '
+                            'content-paned=%dx%d '
+                            'ws-vte=%dx%d '
+                            'paned-vte=%dx%d '
+                            'term-vte=%dx%d' % (
+                            ca.width - pa.width,
+                            ca.height - pa.height,
+                            ws[0] - va.width,
+                            ws[1] - va.height,
+                            pa.width - va.width,
+                            pa.height - va.height,
+                            ta.width - va.width,
+                            ta.height - va.height))
+                    elif ca:
+                        dbg('do_resize chrome: '
+                            'NO PANED '
+                            'content-term=%dx%d '
+                            'ws-vte=%dx%d '
+                            'term-vte=%dx%d' % (
+                            ca.width - ta.width,
+                            ca.height - ta.height,
+                            ws[0] - va.width,
+                            ws[1] - va.height,
+                            ta.width - va.width,
+                            ta.height - va.height))
                     break
                 except Exception:
                     pass
