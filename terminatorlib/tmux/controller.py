@@ -91,6 +91,10 @@ class TmuxController:
         self._applying_layout = False
         self._layout_applied_time = 0
         self._resize_timer = None
+        self._tmux_max_chars = None
+        self._tripwire_timer = None
+        self._tripwire_armed = False
+        self._tripwire_pixels = None
         self._initial_layout_ready = threading.Event()
         self.session_name = None
         self.protocol = None
@@ -403,6 +407,22 @@ class TmuxController:
                 except Exception:
                     pass
 
+            # Log current window state every do_resize
+            for t in self.terminal_to_pane:
+                try:
+                    top = t.get_toplevel()
+                    ws = top.get_size()
+                    wa = top.get_allocation()
+                    va = t.vte.get_allocation()
+                    vc = t.vte.get_column_count()
+                    vr = t.vte.get_row_count()
+                    dbg('do_resize state: win_size=%dx%d win_alloc=%dx%d '
+                        'vte=%dx%d vte_chars=%dx%d' % (
+                        ws[0], ws[1], wa.width, wa.height,
+                        va.width, va.height, vc, vr))
+                    break
+                except Exception:
+                    pass
             dbg('notify_resize: window_resized=%s pane_count=%d' % (
                 window_resized, len(self.terminal_to_pane)))
             if window_resized or len(self.terminal_to_pane) <= 1:
@@ -410,6 +430,29 @@ class TmuxController:
                 total_cols, total_rows = self._calculate_client_size()
                 if total_cols > 0 and total_rows > 0:
                     size = (total_cols, total_rows)
+                    # Check if the window hit the tripwire pixel
+                    # boundary (trying to grow past the known max)
+                    win_px = self._last_window_pixels
+                    if (self._tripwire_armed and self._tripwire_pixels
+                            and win_px and (
+                            win_px[0] >= self._tripwire_pixels[0] or
+                            win_px[1] >= self._tripwire_pixels[1])):
+                        # Lift the constraint — the WM will snap the
+                        # window to the mouse position, and normal
+                        # do_resize flow takes over from here.
+                        # Re-arm after idle to detect future constraints.
+                        dbg('notify_resize: tripwire hit %dx%d > %dx%d, '
+                            'lifting constraint' % (
+                                size[0], size[1],
+                                self._tmux_max_chars[0],
+                                self._tmux_max_chars[1]))
+                        self._tripwire_armed = False
+                        self._tripwire_pixels = None
+                        # Clear geometry hints but keep _tmux_max_chars
+                        # so _update_max_from_tree won't ratchet down
+                        if self.handlers:
+                            self.handlers._clear_tmux_max_size()
+                        # Fall through to normal resize path below
                     if size != self._last_client_size:
                         self._last_client_size = size
                         dbg('sending refresh-client -C %d,%d' % (total_cols, total_rows))
@@ -425,6 +468,39 @@ class TmuxController:
             return False
 
         self._resize_timer = GLib.timeout_add(100, do_resize)
+
+    def _do_arm_tripwire(self):
+        """Set max to the next character boundary so we can detect
+        when the user tries to grow past the current max."""
+        if not self._tmux_max_chars or not self.handlers:
+            return False
+        cols, rows = self._tmux_max_chars
+        info_next = self.handlers._chars_to_max_pixels(
+            cols + 1, rows + 1)
+        if not info_next:
+            return False
+        trip_w, trip_h = info_next[0], info_next[1]
+        # _set_max_size_pixels adds CSD and returns allocation-space
+        # values, which match _last_window_pixels (get_allocation)
+        hint_w, hint_h = self.handlers._set_max_size_pixels(
+            trip_w, trip_h)
+        dbg('arming tripwire: chars=%dx%d '
+            'trip=%dx%d px (hint=%dx%d)' % (
+                cols, rows, trip_w, trip_h, hint_w, hint_h))
+        self._tripwire_pixels = (hint_w, hint_h)
+        self._tripwire_armed = True
+        return False
+
+    def _arm_tripwire_after_idle(self):
+        """Arm the tripwire after 2s of idle (initial or rejection)."""
+        if self._tripwire_timer:
+            GLib.source_remove(self._tripwire_timer)
+
+        def _arm():
+            self._tripwire_timer = None
+            return self._do_arm_tripwire()
+
+        self._tripwire_timer = GLib.timeout_add(2000, _arm)
 
     def _send_split_bar_resize(self):
         """Send absolute resize-pane for the pane with the largest size change.

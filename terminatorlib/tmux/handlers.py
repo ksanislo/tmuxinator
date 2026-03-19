@@ -121,12 +121,32 @@ class TmuxHandlers:
                              client_size[0], client_size[1],
                              new_size[0], new_size[1], elapsed))
                 self.controller._last_client_size = new_size
+                # Reset max so _update_max_from_tree can lower it
+                self.controller._tmux_max_chars = None
                 GLib.idle_add(self._resize_window_to_tree, new_tree)
             elif client_size and new_size != client_size:
-                dbg('layout-change: echo-back size change '
-                         '%dx%d -> %dx%d (elapsed=%.3fs), not resizing' % (
-                             client_size[0], client_size[1],
-                             new_size[0], new_size[1], elapsed))
+                # Tmux gave us a different size than we asked for
+                rejected = (new_size[0] < client_size[0] or
+                            new_size[1] < client_size[1])
+                if rejected:
+                    dbg('layout-change: tmux rejected %dx%d -> %dx%d '
+                             '(elapsed=%.3fs), re-constraining' % (
+                                 client_size[0], client_size[1],
+                                 new_size[0], new_size[1], elapsed))
+                    # Reset max so _update_max_from_tree can set it
+                    self.controller._tmux_max_chars = None
+                    self.controller._last_client_size = new_size
+                    GLib.idle_add(self._resize_window_to_tree, new_tree)
+                else:
+                    dbg('layout-change: echo-back size change '
+                             '%dx%d -> %dx%d (elapsed=%.3fs)' % (
+                                 client_size[0], client_size[1],
+                                 new_size[0], new_size[1], elapsed))
+                    self.controller._last_client_size = new_size
+
+            # Update max size from tree dimensions (free, no query)
+            GLib.idle_add(self._update_max_from_tree,
+                          new_tree.width, new_tree.height)
 
             # Same panes but resized — update our splits to match
             GLib.idle_add(self._update_pane_sizes, new_tree)
@@ -890,6 +910,132 @@ class TmuxHandlers:
         self._refresh_pane_titles()
         self._refresh_tab_labels()
 
+    def _chars_to_max_pixels(self, cols, rows):
+        """Convert character dimensions to max pixel size for geometry hints.
+
+        Accounts for layout structure, chrome, and CSD."""
+        terminals = list(self.controller.terminal_to_pane.keys())
+        if not terminals:
+            return None
+
+        term = None
+        char_w = char_h = sb_w = tb_h = vpad_x = vpad_y = 0
+        for t in terminals:
+            char_w, char_h, sb_w, tb_h, vpad_x, vpad_y = \
+                self._get_terminal_metrics(t)
+            if char_w > 0:
+                term = t
+                break
+        if not term or char_w <= 0:
+            return None
+
+        handle_size = self._get_handle_size(term)
+
+        # Use the current layout tree for structural info (separators etc)
+        tree = None
+        for tree in self._layout_trees.values():
+            break
+        if tree is None:
+            return None
+
+        target_w = self._subtree_px(tree, 'h', char_w, char_h, sb_w, tb_h,
+                                     handle_size, vpad_x, vpad_y)
+        target_h = self._subtree_px(tree, 'v', char_w, char_h, sb_w, tb_h,
+                                     handle_size, vpad_x, vpad_y)
+
+        # Scale from tree's char dimensions to the requested dimensions
+        if tree.width > 0 and tree.height > 0:
+            target_w = target_w * cols / tree.width
+            target_h = target_h * rows / tree.height
+
+        window = term.get_toplevel()
+
+        # Measure chrome: everything between window content size and
+        # the VTE area (tab bar, margins, borders, etc.)
+        ws = window.get_size()
+        vte_alloc = term.vte.get_allocation()
+        chrome_w = ws[0] - vte_alloc.width
+        chrome_h = ws[1] - vte_alloc.height
+
+        max_w = int(target_w) + chrome_w
+        max_h = int(target_h) + chrome_h
+
+        return (max_w, max_h, chrome_w, chrome_h, 0, 0)
+
+    def _set_max_size_pixels(self, max_w, max_h):
+        """Apply max size geometry hints on the GTK window.
+
+        max_w/max_h are content-based (get_size() coordinate space).
+        Geometry hints constrain the outer allocation (including CSD),
+        so we add CSD to reach the intended content max.
+        Returns (hint_w, hint_h) — the actual values set on the hint
+        (in allocation space, i.e. content + CSD).
+        """
+        terminals = list(self.controller.terminal_to_pane.keys())
+        if not terminals:
+            return (max_w, max_h)
+        window = terminals[0].get_toplevel()
+        window._tmux_max_size = (max_w, max_h)
+        # CSD = difference between outer allocation and content size
+        alloc = window.get_allocation()
+        ws = window.get_size()
+        csd_w = max(0, alloc.width - ws[0])
+        csd_h = max(0, alloc.height - ws[1])
+        # If CSD not yet known (window just created), skip —
+        # setting hints without CSD makes the max too tight.
+        # The tripwire will set correct hints once CSD is available.
+        if csd_w == 0 and csd_h == 0:
+            return (max_w, max_h)
+        hint_w = max_w + csd_w
+        hint_h = max_h + csd_h
+        from gi.repository import Gdk
+        geometry = Gdk.Geometry()
+        geometry.max_width = hint_w
+        geometry.max_height = hint_h
+        window.set_geometry_hints(None, geometry, Gdk.WindowHints.MAX_SIZE)
+        return (hint_w, hint_h)
+
+    def _update_max_from_tree(self, cols, rows):
+        """Update max size constraint from layout tree dimensions.
+        Only raises the ceiling, never lowers it — echo-back responses
+        from our own shrink requests should not reduce the max."""
+        cur = self.controller._tmux_max_chars
+        if cur and cols <= cur[0] and rows <= cur[1]:
+            # Not bigger — re-arm tripwire in case probe was rejected
+            if not self.controller._tripwire_armed:
+                self.controller._arm_tripwire_after_idle()
+            return False
+
+        info = self._chars_to_max_pixels(cols, rows)
+        if info is None:
+            return False
+        max_w, max_h, chrome_w, chrome_h, csd_w, csd_h = info
+
+        dbg('tmux max size from tree: %dx%d chars -> %dx%d px '
+                 '(chrome=%dx%d csd=%dx%d)' % (
+                     cols, rows, max_w, max_h,
+                     chrome_w, chrome_h, csd_w, csd_h))
+
+        self.controller._tmux_max_chars = (cols, rows)
+        self._set_max_size_pixels(max_w, max_h)
+        # Re-arm after idle — don't interrupt an ongoing drag
+        self.controller._arm_tripwire_after_idle()
+        return False
+
+    def _clear_tmux_max_size(self):
+        """Remove the max size constraint."""
+        terminals = list(self.controller.terminal_to_pane.keys())
+        if not terminals:
+            return False
+
+        window = terminals[0].get_toplevel()
+        if getattr(window, '_tmux_max_size', None):
+            dbg('clearing tmux max size constraint')
+            window._tmux_max_size = None
+            window.set_geometry_hints(None, None, 0)
+
+        return False
+
     def _resize_window_to_tree(self, tree):
         """Resize our GTK window to match tmux's layout tree dimensions.
 
@@ -920,14 +1066,13 @@ class TmuxHandlers:
                                      handle_size, vpad_x, vpad_y)
 
         window = term.get_toplevel()
-        root_paned = self._find_root_paned(term)
-        chrome_w = chrome_h = 0
-        content = window.get_child()
-        if content and root_paned:
-            content_alloc = content.get_allocation()
-            paned_alloc = root_paned.get_allocation()
-            chrome_w = content_alloc.width - paned_alloc.width
-            chrome_h = content_alloc.height - paned_alloc.height
+        # Chrome = everything between window content size and VTE area
+        # Use get_size() - vte_alloc, NOT content_alloc - paned_alloc
+        # which misses the tab bar when there's no Paned widget.
+        ws = window.get_size()
+        vte_alloc = term.vte.get_allocation()
+        chrome_w = ws[0] - vte_alloc.width
+        chrome_h = ws[1] - vte_alloc.height
 
         win_w = int(target_w) + chrome_w
         win_h = int(target_h) + chrome_h
@@ -986,18 +1131,14 @@ class TmuxHandlers:
         target_h = self._subtree_px(tree, 'v', char_w, char_h, sb_w, tb_h,
                                      handle_size, vpad_x, vpad_y)
 
-        # Chrome between window content area and root Paned.
-        # window.resize() sets the content child (e.g. Notebook) size.
-        # The root Paned is inside that, minus borders and tab bar.
+        # Chrome = everything between window content size and VTE area
+        # Use get_size() - vte_alloc, NOT content_alloc - paned_alloc
+        # which misses the tab bar when there's no Paned widget.
         window = term.get_toplevel()
-        root_paned = self._find_root_paned(term)
-        chrome_w = chrome_h = 0
-        content = window.get_child()
-        if content and root_paned:
-            content_alloc = content.get_allocation()
-            paned_alloc = root_paned.get_allocation()
-            chrome_w = content_alloc.width - paned_alloc.width
-            chrome_h = content_alloc.height - paned_alloc.height
+        ws = window.get_size()
+        vte_alloc = term.vte.get_allocation()
+        chrome_w = ws[0] - vte_alloc.width
+        chrome_h = ws[1] - vte_alloc.height
 
         # Get screen limits
         from gi.repository import Gdk

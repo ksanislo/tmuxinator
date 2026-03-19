@@ -705,7 +705,14 @@ class Window(Container, Gtk.Window):
             self.cached_maker = Factory()
         maker = self.cached_maker
         if maker.isinstance(self.get_child(), 'Notebook'):
-            dbg("We don't currently support geometry hinting with tabs")
+            max_size = getattr(self, '_tmux_max_size', None)
+            if max_size:
+                geometry = Gdk.Geometry()
+                geometry.max_width = max_size[0]
+                geometry.max_height = max_size[1]
+                self.set_geometry_hints(None, geometry, Gdk.WindowHints.MAX_SIZE)
+            else:
+                dbg("We don't currently support geometry hinting with tabs")
             return
 
         terminals = self.get_visible_terminals()
@@ -749,7 +756,15 @@ class Window(Container, Gtk.Window):
         self.set_geometry_hints(None, geometry, Gdk.WindowHints.BASE_SIZE | Gdk.WindowHints.RESIZE_INC)
 
     def disable_geometry_hints(self):
-        self.set_geometry_hints(None, None, 0)
+        max_size = getattr(self, '_tmux_max_size', None)
+        if max_size:
+            from gi.repository import Gdk
+            geometry = Gdk.Geometry()
+            geometry.max_width = max_size[0]
+            geometry.max_height = max_size[1]
+            self.set_geometry_hints(None, geometry, Gdk.WindowHints.MAX_SIZE)
+        else:
+            self.set_geometry_hints(None, None, 0)
 
     def tab_change(self, widget, num=None):
         """Change to a specific tab"""
