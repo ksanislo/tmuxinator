@@ -102,6 +102,7 @@ class TmuxController:
         self._last_client_size = None
         self._last_window_pixels = None
         self._last_chrome = None  # (w, h) content-term chrome
+        self._pending_output = {}  # pane_id -> [data, ...] for pre-registration %output
         self._origin_terminal = None  # terminal that ran tmux -CC (PTY takeover)
 
     def start(self, session_name, new_session=False):
@@ -251,6 +252,22 @@ class TmuxController:
         self.terminal_to_pane[terminal] = pane_id
         terminal._tmux_controller = self
         dbg('TmuxController: registered terminal for pane %s' % pane_id)
+
+        # Replay any %output that arrived before registration
+        pending = self._pending_output.pop(pane_id, None)
+        if pending:
+            dbg('TmuxController: replaying %d buffered chunks for pane %s' % (len(pending), pane_id))
+            for data in pending:
+                GLib.idle_add(self._replay_output, terminal, data)
+
+    def _replay_output(self, terminal, data):
+        """Feed buffered output to terminal VTE. Called on GTK thread."""
+        try:
+            if hasattr(terminal, 'vte') and terminal.vte:
+                terminal.vte.feed(data)
+        except Exception as e:
+            dbg('TmuxController: replay feed error: %s' % e)
+        return False
 
     def unregister_terminal(self, terminal):
         """Unregister a terminal widget."""

@@ -43,6 +43,13 @@ class TmuxHandlers:
 
         terminal = self.controller.pane_to_terminal.get(pane_id)
         if not terminal:
+            # Buffer output for panes not yet registered (race: %output
+            # arrives before _create_tab_for_window finishes).
+            buf = self.controller._pending_output
+            if pane_id not in buf:
+                buf[pane_id] = []
+            buf[pane_id].append(data)
+            dbg('TmuxHandlers: buffered %output for unregistered pane %s (%d chunks)' % (pane_id, len(buf[pane_id])))
             return
 
         # Track alternate screen state (vim, less, etc.)
@@ -720,8 +727,6 @@ class TmuxHandlers:
         if not tree.is_leaf:
             self._build_split_tree(tree, root_terminal, maker)
 
-        # Don't capture pane content for new tabs — live %output
-        # will deliver the prompt. Capturing would duplicate it.
         return False
 
     def _first_leaf(self, node):

@@ -361,9 +361,37 @@ class Terminator(Borg):
                 err('invalid layout format. %s' % layout)
                 raise(ValueError)
             window, terminal = self.new_window()
-            # No rough resize — _send_initial_resize handles sizing
-            # with real VTE metrics once the window is realized.
             window.create_layout(layout[windef])
+            if 'tmux_size' in layout[windef]:
+                # Resize AFTER create_layout so Notebook/tabs exist.
+                # Both happen before GTK main loop = atomic layout.
+                # Use preferred heights to probe tab chrome since
+                # allocations aren't available yet.
+                size = layout[windef]['tmux_size']
+                cols, rows = int(size[0]), int(size[1])
+                cw = terminal.vte.get_char_width() or 10
+                ch = terminal.vte.get_char_height() or 18
+                target_w = cols * cw
+                target_h = rows * ch
+                chrome_w = 0
+                chrome_h = 0
+                content = window.get_child()
+                if content:
+                    _, content_nat_w = content.get_preferred_width()
+                    _, content_nat_h = content.get_preferred_height()
+                    terms = window.get_terminals()
+                    if terms:
+                        t = terms[0]
+                        _, term_nat_w = t.get_preferred_width()
+                        _, term_nat_h = t.get_preferred_height()
+                        chrome_w = max(0, content_nat_w - term_nat_w)
+                        chrome_h = max(0, content_nat_h - term_nat_h)
+                dbg('pre-resize: tmux=%dx%d char=%dx%d '
+                    'target=%dx%d chrome=%dx%d' % (
+                    cols, rows, cw, ch,
+                    target_w, target_h, chrome_w, chrome_h))
+                window.resize(target_w + chrome_w,
+                              target_h + chrome_h)
 
         self.layoutname = 'tmux'
 
