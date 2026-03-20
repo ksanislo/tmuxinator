@@ -591,11 +591,6 @@ class HPaned(Paned, Gtk.HPaned):
                 if new_pos != old_pos:
                     Gtk.HPaned.set_position(self, new_pos)
                     self.set_property('position-set', True)
-            else:
-                dbg('HPaned alloc: %dx%d (unchanged, '
-                    'pos=%d child2=%d)' % (
-                    allocation.width, allocation.height,
-                    self.get_position(), child2_px))
         Gtk.HPaned.do_size_allocate(self, allocation)
 
     def get_length(self):
@@ -680,11 +675,6 @@ class VPaned(Paned, Gtk.VPaned):
                 if new_pos != old_pos:
                     Gtk.VPaned.set_position(self, new_pos)
                     self.set_property('position-set', True)
-            else:
-                dbg('VPaned alloc: %dx%d (unchanged, '
-                    'pos=%d child2=%d)' % (
-                    allocation.width, allocation.height,
-                    self.get_position(), child2_px))
         Gtk.VPaned.do_size_allocate(self, allocation)
 
     def get_length(self):
