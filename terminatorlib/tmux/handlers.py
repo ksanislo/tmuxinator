@@ -26,7 +26,7 @@ class TmuxHandlers:
         self._layout_trees = {}  # window_id -> LayoutNode tree
         self._needs_ratio_retry = False
         self._reconcile_timer = None
-        self._capture_after_ratios = False
+        self._initial_capture_pending = False
         # Register handlers
         self.protocol.add_handler('output', self.on_output)
         self.protocol.add_handler('layout-change', self.on_layout_change)
@@ -160,7 +160,8 @@ class TmuxHandlers:
                          '%dx%d -> %dx%d (elapsed=%.3fs), resizing window' % (
                              client_size[0], client_size[1],
                              new_size[0], new_size[1], elapsed))
-                self.controller._tmux_max_chars = None
+                self.controller._tmux_max_cols = None
+                self.controller._tmux_max_rows = None
                 GLib.idle_add(self._resize_window_to_tree, new_tree)
             elif client_size and new_size != client_size:
                 rejected = (new_size[0] < client_size[0] or
@@ -170,7 +171,7 @@ class TmuxHandlers:
                              '(elapsed=%.3fs), re-constraining' % (
                                  client_size[0], client_size[1],
                                  new_size[0], new_size[1], elapsed))
-                    # Don't clear _tmux_max_chars or call _resize_window_to_tree
+                    # Don't clear max or call _resize_window_to_tree
                     # here — _update_max_from_tree will set the hard MAX hint
                     # and the WM enforces the constraint. Snapping back during
                     # drag fights the mouse and causes jitter.
@@ -256,9 +257,6 @@ class TmuxHandlers:
                 if self.controller._last_client_size is not None:
                     self._snapshot_vte_sizes()
                 self._schedule_reconcile(tree)
-                if self._capture_after_ratios:
-                    self._capture_after_ratios = False
-                    self._send_captures()
         return False
 
     def _apply_ratios_and_finish(self, tree):
@@ -942,33 +940,47 @@ class TmuxHandlers:
         self.controller._initial_layout_ready.set()
 
     def capture_initial_content(self):
-        """Capture and display initial pane content after terminals are registered.
+        """Set up initial state after terminals are registered.
 
-        Sends the initial resize command immediately, but defers the
-        actual content capture until after the first _update_pane_sizes
-        applies ratios. This ensures VTEs are at the correct size when
-        captured content is fed, preventing wrapping artifacts.
+        Sends the initial resize command, captures existing pane content
+        once (for re-attach), and starts the periodic title refresh timer.
+        After this initial capture, all content comes via %output.
         """
         self._send_initial_resize()
-        self._capture_after_ratios = True
+        # Defer initial capture until after first ratio reconciliation
+        # so VTEs are at the correct size. Only fires once.
+        self._initial_capture_pending = True
+        self._refresh_pane_titles()
+        self._refresh_tab_labels()
         self._title_timer = GLib.timeout_add(3000, self._periodic_title_refresh)
 
-    def _send_captures(self):
-        """Send capture-pane commands for all panes.
+    def _send_initial_captures(self):
+        """One-shot capture of existing pane content for re-attach.
 
-        Called after ratio application so VTEs are at the correct size
-        when captured content is fed. Used on initial attach and after
-        external resize (e.g. another tmux client changed the layout).
+        Called after the first ratio reconciliation so VTEs are at their
+        correct size. Never called again — subsequent content arrives
+        via the %output stream.
         """
-        dbg('sending capture-pane commands (post-ratios)')
+        dbg('sending initial capture-pane commands')
         for window_id, tree in self._layout_trees.items():
             for pane_id in get_pane_ids(tree):
                 self.protocol.send_command(
-                    'capture-pane -J -p -t {} -e -S - -E -'.format(pane_id),
-                    callback=lambda result, pid=pane_id: self._feed_initial_capture(pid, result),
+                    'capture-pane -J -p -t {} -e -S - -E -'.format(
+                        pane_id),
+                    callback=lambda result, pid=pane_id:
+                        self._feed_initial_capture(pid, result),
                 )
-        self._refresh_pane_titles()
-        self._refresh_tab_labels()
+
+    def _feed_initial_capture(self, pane_id, result):
+        """Feed initially captured content to the right terminal."""
+        if result.is_error:
+            return
+        terminal = self.controller.pane_to_terminal.get(pane_id)
+        if terminal and result.output_lines:
+            from terminatorlib.tmux.protocol import unescape_tmux_output
+            raw = b'\r\n'.join(line for line in result.output_lines if line)
+            data = unescape_tmux_output(raw)
+            GLib.idle_add(self._feed_terminal, terminal, data)
 
     def _chars_to_max_pixels(self, cols, rows):
         """Convert character dimensions to max pixel size for geometry hints.
@@ -1065,41 +1077,67 @@ class TmuxHandlers:
         return (hint_w, hint_h)
 
     def _update_max_from_tree(self, cols, rows):
-        """Update max size constraint from layout tree dimensions."""
-        # Skip during initial startup — setting max before the first
-        # resize takes effect causes the hint to override the resize.
+        """Update per-axis max size constraints from layout tree dimensions.
+
+        Each axis is tracked independently: a column limit doesn't
+        prevent the user from adding rows, and vice versa.
+        """
         if self.controller._last_client_size is None:
             dbg('size_trace update_max: skipped (initial startup)')
             return False
-        cur = self.controller._tmux_max_chars
-        grew = not cur or cols > cur[0] or rows > cur[1]
 
-        if grew:
-            # Tmux accepted growth — update max but DON'T set
-            # geometry hints so the window can grow freely during
-            # an active drag.  Arm tripwire instantly.
-            dbg('size_trace update_max: grew %dx%d -> %dx%d' % (
-                cur[0] if cur else 0, cur[1] if cur else 0,
-                cols, rows))
-            self.controller._tmux_max_chars = (cols, rows)
+        sent = self.controller._last_client_size
+        max_c = self.controller._tmux_max_cols
+        max_r = self.controller._tmux_max_rows
+
+        # Per-axis: did tmux exceed a known limit (grew) or reject?
+        grew_c = max_c is not None and cols > max_c
+        grew_r = max_r is not None and rows > max_r
+        rej_c = sent and cols < sent[0]
+        rej_r = sent and rows < sent[1]
+
+        if grew_c or grew_r:
+            # Exceeded a known limit — clear that axis's constraint
+            if grew_c:
+                self.controller._tmux_max_cols = None
+            if grew_r:
+                self.controller._tmux_max_rows = None
+            dbg('size_trace update_max: grew cols=%s->%d rows=%s->%d' % (
+                max_c or 'free', cols, max_r or 'free', rows))
+
+        if rej_c or rej_r:
+            # At least one axis was rejected — constrain only that axis.
+            if rej_c:
+                self.controller._tmux_max_cols = cols
+            if rej_r:
+                self.controller._tmux_max_rows = rows
+            dbg('size_trace update_max: rejected '
+                'sent=%dx%d got=%dx%d max_cols=%s max_rows=%s' % (
+                sent[0], sent[1], cols, rows,
+                self.controller._tmux_max_cols or 'free',
+                self.controller._tmux_max_rows or 'free'))
+            # Use constraint values for pixel computation, not tree values.
+            # The tree may be smaller than the limit (e.g. 118 cols when
+            # max is 132) — we need MAX at the limit, not current size.
+            hint_cols = self.controller._tmux_max_cols \
+                if self.controller._tmux_max_cols is not None else cols
+            hint_rows = self.controller._tmux_max_rows \
+                if self.controller._tmux_max_rows is not None else rows
+            info = self._chars_to_max_pixels(hint_cols, hint_rows)
+            if info:
+                # Use accumulated state, not just this cycle's rejection,
+                # so existing constraints on the other axis are preserved.
+                max_w = info[0] if self.controller._tmux_max_cols is not None else 32767
+                max_h = info[1] if self.controller._tmux_max_rows is not None else 32767
+                self._set_max_size_pixels(max_w, max_h)
+            self.controller._arm_tripwire_after_idle()
+        elif grew_c or grew_r:
+            # Grew past a limit — arm tripwire instantly
             self.controller._do_arm_tripwire()
         else:
-            # Didn't grow. If we asked for more than we got,
-            # that's a rejection — constrain and resize down.
-            # Only re-arm after 2s so user must start a fresh drag.
-            sent = self.controller._last_client_size
-            if sent and (cols < sent[0] or rows < sent[1]):
-                dbg('size_trace update_max: rejected '
-                    'sent=%dx%d got=%dx%d' % (
-                    sent[0], sent[1], cols, rows))
-                info = self._chars_to_max_pixels(cols, rows)
-                if info:
-                    self.controller._tmux_max_chars = (cols, rows)
-                    self._set_max_size_pixels(info[0], info[1])
-                self.controller._arm_tripwire_after_idle()
-            elif not self.controller._tripwire_armed \
+            # Echo-back confirmation, no change
+            if not self.controller._tripwire_armed \
                     and not self.controller._tripwire_timer:
-                # Echo-back with no pending delayed arm — arm instantly
                 self.controller._do_arm_tripwire()
         return False
 
@@ -1174,8 +1212,6 @@ class TmuxHandlers:
         # window resize (not a split drag) when VTE sizes change
         self.controller._last_window_pixels = (win_w, win_h)
         self.controller._layout_applied_time = time.monotonic()
-        # Recapture content after ratios are applied for the new size
-        self._capture_after_ratios = True
         return False
 
     def _send_initial_resize(self):
@@ -1333,17 +1369,6 @@ class TmuxHandlers:
                 fit_cols, fit_rows, tree.width, tree.height))
             self.protocol.send_command(
                 'refresh-client -C {},{}'.format(fit_cols, fit_rows))
-
-    def _feed_initial_capture(self, pane_id, result):
-        """Feed initially captured content to the right terminal."""
-        if result.is_error:
-            return
-        terminal = self.controller.pane_to_terminal.get(pane_id)
-        if terminal and result.output_lines:
-            from terminatorlib.tmux.protocol import unescape_tmux_output
-            raw = b'\r\n'.join(line for line in result.output_lines if line)
-            data = unescape_tmux_output(raw)
-            GLib.idle_add(self._feed_terminal, terminal, data)
 
     def _periodic_title_refresh(self):
         """Periodically refresh pane titles from tmux.

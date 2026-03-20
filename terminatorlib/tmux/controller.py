@@ -91,7 +91,8 @@ class TmuxController:
         self._applying_layout = False
         self._layout_applied_time = 0
         self._resize_timer = None
-        self._tmux_max_chars = None
+        self._tmux_max_cols = None   # per-axis max from tmux rejection
+        self._tmux_max_rows = None
         self._tripwire_timer = None
         self._tripwire_armed = False
         self._tripwire_pixels = None
@@ -451,11 +452,15 @@ class TmuxController:
                         window_resized = True
                         self._last_window_pixels = px
                     # Check if we hit the tripwire boundary
+                    # Only check constrained axes
                     if (self._tripwire_armed and self._tripwire_pixels
-                            and px and (
-                            px[0] >= self._tripwire_pixels[0] or
-                            px[1] >= self._tripwire_pixels[1])):
-                        tripwire_hit = True
+                            and px):
+                        hit_w = (self._tmux_max_cols is not None
+                                 and px[0] >= self._tripwire_pixels[0])
+                        hit_h = (self._tmux_max_rows is not None
+                                 and px[1] >= self._tripwire_pixels[1])
+                        if hit_w or hit_h:
+                            tripwire_hit = True
                     break
                 except Exception:
                     pass
@@ -529,15 +534,17 @@ class TmuxController:
                 if total_cols > 0 and total_rows > 0:
                     size = (total_cols, total_rows)
                     if tripwire_hit:
-                        dbg('notify_resize: tripwire hit %dx%d > %dx%d, '
-                            'lifting constraint' % (
+                        dbg('notify_resize: tripwire hit %dx%d > %sx%s, '
+                            'probing' % (
                                 size[0], size[1],
-                                self._tmux_max_chars[0],
-                                self._tmux_max_chars[1]))
+                                self._tmux_max_cols or '-',
+                                self._tmux_max_rows or '-'))
                         self._tripwire_armed = False
                         self._tripwire_pixels = None
-                        if self.handlers:
-                            self.handlers._clear_tmux_max_size()
+                        # Don't clear MAX hints — keep the window at
+                        # max+1 (tripwire boundary). The refresh-client
+                        # will probe tmux; _update_max_from_tree handles
+                        # the response (accept → clear, reject → re-constrain).
                     if size != self._last_client_size:
                         self._last_client_size = size
                         dbg('sending refresh-client -C %d,%d' % (total_cols, total_rows))
@@ -545,6 +552,12 @@ class TmuxController:
                             'refresh-client -C {},{}'.format(total_cols, total_rows))
                         # Refresh layout state after resize
                         self._refresh_layout_state()
+                        # Fire one-shot initial capture now that VTE
+                        # is sized
+                        if self.handlers and \
+                                self.handlers._initial_capture_pending:
+                            self.handlers._initial_capture_pending = False
+                            self.handlers._send_initial_captures()
             else:
                 # Split bar drag: send absolute resize for the most-changed pane
                 self._send_split_bar_resize()
@@ -556,22 +569,40 @@ class TmuxController:
 
     def _do_arm_tripwire(self):
         """Set max to the next character boundary so we can detect
-        when the user tries to grow past the current max."""
-        if not self._tmux_max_chars or not self.handlers:
+        when the user tries to grow past the current max.
+        Only constrains axes that have a known limit; unconstrained
+        axes get screen-max so the user can freely resize them."""
+        if (self._tmux_max_cols is None and self._tmux_max_rows is None) \
+                or not self.handlers:
             return False
-        cols, rows = self._tmux_max_chars
+        # For constrained axes, probe +1 char beyond the limit.
+        # For unconstrained axes, use current tree size (no limit).
+        tree = None
+        for tree in self.handlers._layout_trees.values():
+            break
+        if tree is None:
+            return False
+        probe_cols = (self._tmux_max_cols + 1) if self._tmux_max_cols \
+            else tree.width
+        probe_rows = (self._tmux_max_rows + 1) if self._tmux_max_rows \
+            else tree.height
         info_next = self.handlers._chars_to_max_pixels(
-            cols + 1, rows + 1)
+            probe_cols, probe_rows)
         if not info_next:
             return False
         trip_w, trip_h = info_next[0], info_next[1]
-        # _set_max_size_pixels adds CSD and returns allocation-space
-        # values, which match _last_window_pixels (get_allocation)
-        hint_w, hint_h = self.handlers._set_max_size_pixels(
-            trip_w, trip_h)
-        dbg('arming tripwire: chars=%dx%d '
+        # For unconstrained axes, use a very large value so
+        # the WM doesn't limit that axis and tripwire never fires.
+        max_w = trip_w if self._tmux_max_cols is not None else 32767
+        max_h = trip_h if self._tmux_max_rows is not None else 32767
+        # _set_max_size_pixels adds CSD → allocation-space values
+        hint_w, hint_h = self.handlers._set_max_size_pixels(max_w, max_h)
+        dbg('arming tripwire: cols=%s rows=%s '
             'trip=%dx%d px (hint=%dx%d)' % (
-                cols, rows, trip_w, trip_h, hint_w, hint_h))
+                self._tmux_max_cols or 'free',
+                self._tmux_max_rows or 'free',
+                max_w, max_h, hint_w, hint_h))
+        # Store in allocation space to match get_allocation() comparison
         self._tripwire_pixels = (hint_w, hint_h)
         self._tripwire_armed = True
         return False
