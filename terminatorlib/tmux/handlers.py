@@ -109,8 +109,19 @@ class TmuxHandlers:
                     return window
         return None
 
-    def _is_active_window(self, tree):
+    def _is_active_window(self, tree, window_id=None):
         """Check if this layout tree's panes are in the currently visible tab."""
+        # Check tmux's active window flag first (reliable before
+        # terminals are mapped and during rapid resize sequences)
+        if window_id is None:
+            awid = self.controller.active_window_id
+            if awid:
+                for wid, t in self._layout_trees.items():
+                    if t is tree:
+                        return wid == awid
+        elif self.controller.active_window_id:
+            return window_id == self.controller.active_window_id
+        # Fall back to GTK mapped state
         pane_ids = get_pane_ids(tree)
         for pid in pane_ids:
             terminal = self.controller.pane_to_terminal.get(pid)
@@ -178,7 +189,7 @@ class TmuxHandlers:
             # Only process resize/constraint logic for the active
             # window (panes currently visible). Background windows
             # (e.g. @30 at 132x40) must not resize us or set MAX.
-            active = self._is_active_window(new_tree)
+            active = self._is_active_window(new_tree, window_id)
             if not active:
                 dbg('layout-change: skipping resize for background '
                     'window %s' % window_id)
@@ -1039,19 +1050,22 @@ class TmuxHandlers:
             decoded = line.decode('utf-8', errors='replace').strip()
             if not decoded:
                 continue
-            # Format: W:@WINDOW_ID:WINDOW_INDEX:WINDOW_NAME:LAYOUT_STRING
+            # Format: W:@WINDOW_ID:INDEX:NAME:ACTIVE:LAYOUT
             if not decoded.startswith('W:@'):
                 dbg('TmuxHandlers: skipping invalid line: %s' % decoded)
                 continue
             # Strip the W: prefix, split on colons
-            rest = decoded[2:]  # "@WINDOW_ID:WINDOW_INDEX:WINDOW_NAME:LAYOUT_STRING"
-            parts = rest.split(':', 3)
-            if len(parts) < 4:
+            rest = decoded[2:]
+            parts = rest.split(':', 4)
+            if len(parts) < 5:
                 continue
             window_id = parts[0]
             window_index = parts[1]
             window_name = parts[2]
-            layout_string = parts[3]
+            window_active = parts[3]
+            layout_string = parts[4]
+            if window_active == '1':
+                self.controller.active_window_id = window_id
             self.controller.window_layouts[window_id] = layout_string
             self.controller.window_names[window_id] = window_name
             self.controller.window_indices[window_id] = window_index
@@ -1133,10 +1147,14 @@ class TmuxHandlers:
 
         # Use the active window's tree for structural info
         tree = None
-        for t in self._layout_trees.values():
-            if self._is_active_window(t):
-                tree = t
-                break
+        awid = self.controller.active_window_id
+        if awid and awid in self._layout_trees:
+            tree = self._layout_trees[awid]
+        if tree is None:
+            for t in self._layout_trees.values():
+                if self._is_active_window(t):
+                    tree = t
+                    break
         if tree is None:
             for tree in self._layout_trees.values():
                 break
@@ -1344,14 +1362,20 @@ class TmuxHandlers:
         screen, clamps to screen size and tells tmux to use the smaller
         dimensions.
         """
-        # Use the active window's tree (the one whose panes are
-        # in the visible tab), not just the first dict entry —
-        # other windows may have been pre-shrunk by tmux.
+        # Use the active window's tree — other windows may have
+        # been pre-shrunk by tmux.  Prefer the window ID from
+        # tmux's active flag (available before terminals are
+        # mapped), then fall back to _is_active_window (checks
+        # which tab is visible).
         tree = None
-        for t in self._layout_trees.values():
-            if self._is_active_window(t):
-                tree = t
-                break
+        awid = self.controller.active_window_id
+        if awid and awid in self._layout_trees:
+            tree = self._layout_trees[awid]
+        if tree is None:
+            for t in self._layout_trees.values():
+                if self._is_active_window(t):
+                    tree = t
+                    break
         if tree is None:
             for tree in self._layout_trees.values():
                 break

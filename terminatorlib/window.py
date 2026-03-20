@@ -827,9 +827,22 @@ class Window(Container, Gtk.Window):
             csd_w = wa.width - ws[0]
             csd_h = wa.height - ws[1]
             ca = content.get_allocation()
-            ta = terminal.get_allocation()
-            chrome_w = max(0, ca.width - ta.width)
-            chrome_h = max(0, ca.height - ta.height)
+            # Chrome = tab bar + borders, NOT other panes.
+            # Use the notebook page (not the terminal) so splits
+            # don't inflate the base size.
+            if hasattr(content, 'get_current_page'):
+                page_num = content.get_current_page()
+                if page_num >= 0:
+                    page = content.get_nth_page(page_num)
+                    pa = page.get_allocation()
+                    chrome_w = max(0, ca.width - pa.width)
+                    chrome_h = max(0, ca.height - pa.height)
+                else:
+                    chrome_w = chrome_h = 0
+            else:
+                ta = terminal.get_allocation()
+                chrome_w = max(0, ca.width - ta.width)
+                chrome_h = max(0, ca.height - ta.height)
             base_w = csd_w + chrome_w
             base_h = csd_h + chrome_h
 

@@ -104,6 +104,7 @@ class TmuxController:
         self._last_client_size = None
         self._last_window_pixels = None
         self._last_chrome = None  # (w, h) content-term chrome
+        self.active_window_id = None  # @id of tmux's active window
         self._pending_output = {}  # pane_id -> [data, ...] for pre-registration %output
         self._origin_terminal = None  # terminal that ran tmux -CC (PTY takeover)
 
@@ -244,7 +245,7 @@ class TmuxController:
         Uses colon separator to avoid brace-related PTY echo issues.
         """
         self.protocol.send_command(
-            'list-windows -F "W:#{window_id}:#{window_index}:#{window_name}:#{window_layout}"',
+            'list-windows -F "W:#{window_id}:#{window_index}:#{window_name}:#{window_active}:#{window_layout}"',
             callback=self.handlers.on_initial_list_windows,
         )
 
@@ -711,7 +712,7 @@ class TmuxController:
     def _refresh_layout_state(self):
         """Send list-windows to refresh our layout tree after a resize."""
         self.protocol.send_command(
-            'list-windows -F "W:#{window_id}:#{window_index}:#{window_name}:#{window_layout}"',
+            'list-windows -F "W:#{window_id}:#{window_index}:#{window_name}:#{window_active}:#{window_layout}"',
             callback=self.handlers.on_initial_list_windows,
         )
 
