@@ -254,6 +254,7 @@ class TmuxHandlers:
             except Exception:
                 pass
         self.controller._applying_layout = True
+        dbg('_apply_layout_to_tree: set _applying_layout=True')
         deferred = False
         try:
             self._record_tmux_sizes(tree)
@@ -266,16 +267,17 @@ class TmuxHandlers:
                     deferred = True
         finally:
             if not deferred:
-                self.controller._applying_layout = False
+                import time
+                # Set _layout_applied_time so notify_resize passes the
+                # initial gate check, but keep _applying_layout True.
+                # The flag is cleared reactively by notify_resize itself
+                # (via _finish_applying_layout at priority 210) — this
+                # guarantees the clearing happens AFTER the GTK frame
+                # clock has processed allocations and VTE size-allocate
+                # callbacks have been queued.  Idle-based clearing from
+                # here fires before the frame clock and is too early.
                 self.controller._layout_applied_time = time.monotonic()
-                # Snapshot VTE sizes so notify_resize won't see the
-                # ratio-driven size change as a "split drag" — but
-                # skip during initial startup (client_size not yet set)
-                # so the first do_resize can detect the delta and send
-                # resize-pane, which triggers fresh content from tmux.
-                if self.controller._last_client_size is not None:
-                    self._snapshot_vte_sizes()
-                self._schedule_reconcile(tree)
+                self._pending_layout_tree = tree
         return False
 
     def _apply_ratios_and_finish(self, tree):
@@ -284,7 +286,6 @@ class TmuxHandlers:
         _applying_layout stays True until all ratios are applied,
         providing continuous suppression of resize echo-back.
         """
-        import time
         self._needs_ratio_retry = False
         try:
             self._apply_ratios(tree)
@@ -294,12 +295,48 @@ class TmuxHandlers:
                 return False  # keep _applying_layout True
         except Exception:
             pass
+        import time
+        self.controller._layout_applied_time = time.monotonic()
+        self._pending_layout_tree = tree
+        # _applying_layout stays True — cleared reactively by
+        # notify_resize via _finish_applying_layout.
+        return False
+
+    def _finish_applying_layout(self, tree):
+        """Clear _applying_layout after deferred VTE size-allocate
+        handlers have been processed.
+
+        Runs at priority DEFAULT_IDLE+10 (210), which is lower than
+        the deferred notify_resize at DEFAULT_IDLE (200).  This
+        ensures _applying_layout stays True long enough to suppress
+        the stale resize echo-back that would otherwise send a
+        refresh-client with pre-ratio VTE column counts.
+        """
+        import time
+        dbg('_finish_applying_layout: clearing _applying_layout')
         self.controller._applying_layout = False
         self.controller._layout_applied_time = time.monotonic()
         if self.controller._last_client_size is not None:
             self._snapshot_vte_sizes()
+        else:
+            # Initial startup: no notify_resize has run yet.
+            # Calculate and send the client size ourselves so tmux
+            # knows our dimensions and initial captures can fire.
+            cols, rows = self.controller._calculate_client_size()
+            if cols > 0 and rows > 0:
+                size = (cols, rows)
+                self.controller._last_client_size = size
+                dbg('_finish_applying_layout: initial '
+                    'refresh-client -C %d,%d' % (cols, rows))
+                self.controller.protocol.send_command(
+                    'refresh-client -C {},{}'.format(cols, rows))
+                self.controller._refresh_layout_state()
+                if self._initial_capture_pending:
+                    self._initial_capture_pending = False
+                    self._send_initial_captures()
+                self._snapshot_vte_sizes()
         self._schedule_reconcile(tree)
-        return False
+        return False  # don't repeat
 
     def _snapshot_vte_sizes(self):
         """Snapshot current VTE sizes into _prev_vte_sizes.
@@ -444,6 +481,12 @@ class TmuxHandlers:
             if char_w <= 0 or char_h <= 0:
                 break
 
+            # Set tmux handle size override early so all math
+            # (including get_handlesize()) uses char_w/char_h.
+            char_sep = char_w if orient == 'h' else char_h
+            paned._tmux_managed = True
+            paned._tmux_handle_size = char_sep
+
             handle_size = paned.get_handlesize()
             paned_len = paned.get_length()
 
@@ -469,7 +512,6 @@ class TmuxHandlers:
 
             # Pad the first child so the visual gap
             # (padding + handle) = 1 character cell.
-            char_sep = char_w if orient == 'h' else char_h
             if char_sep > handle_size:
                 left_px += char_sep - handle_size
 
@@ -1022,10 +1064,15 @@ class TmuxHandlers:
 
         handle_size = self._get_handle_size(term)
 
-        # Use the current layout tree for structural info (separators etc)
+        # Use the active window's tree for structural info
         tree = None
-        for tree in self._layout_trees.values():
-            break
+        for t in self._layout_trees.values():
+            if self._is_active_window(t):
+                tree = t
+                break
+        if tree is None:
+            for tree in self._layout_trees.values():
+                break
         if tree is None:
             return None
 
@@ -1230,9 +1277,17 @@ class TmuxHandlers:
         screen, clamps to screen size and tells tmux to use the smaller
         dimensions.
         """
+        # Use the active window's tree (the one whose panes are
+        # in the visible tab), not just the first dict entry —
+        # other windows may have been pre-shrunk by tmux.
         tree = None
-        for tree in self._layout_trees.values():
-            break
+        for t in self._layout_trees.values():
+            if self._is_active_window(t):
+                tree = t
+                break
+        if tree is None:
+            for tree in self._layout_trees.values():
+                break
         if tree is None:
             return
 
@@ -1256,10 +1311,16 @@ class TmuxHandlers:
 
         handle_size = self._get_handle_size(term)
 
+        # Measure VTE CSS padding
+        ctx = term.vte.get_style_context()
+        vte_css_pad = ctx.get_padding(ctx.get_state())
         dbg('initial_resize step1: metrics '
-            'char=%dx%d sb=%d tb=%d handle=%d vpad=%dx%d' % (
+            'char=%dx%d sb=%d tb=%d handle=%d vpad=%dx%d '
+            'vte_css_pad=l%d,r%d,t%d,b%d' % (
             char_w, char_h, sb_w, tb_h,
-            handle_size, vpad_x, vpad_y))
+            handle_size, vpad_x, vpad_y,
+            vte_css_pad.left, vte_css_pad.right,
+            vte_css_pad.top, vte_css_pad.bottom))
 
         # Compute pixel dimensions for tmux's layout (content area)
         target_w = self._subtree_px(tree, 'h', char_w, char_h,

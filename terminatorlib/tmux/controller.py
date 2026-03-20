@@ -89,6 +89,7 @@ class TmuxController:
         self._last_pane_sizes = {}
         self._prev_vte_sizes = {}
         self._applying_layout = False
+        self._layout_clear_scheduled = False
         self._layout_applied_time = 0
         self._resize_timer = None
         self._tmux_max_cols = None   # per-axis max from tmux rejection
@@ -388,9 +389,21 @@ class TmuxController:
             return
         dbg('notify_resize: %s %dx%d applying=%s' % (
             pane_id, cols, rows, self._applying_layout))
-        # Don't send resize while we're applying a layout from tmux
+        # Don't send resize while we're applying a layout from tmux.
+        # Clear the flag reactively via _finish_applying_layout at
+        # priority 210 — this runs after ALL pending notify_resize
+        # callbacks (priority 200) have been suppressed.
         if self._applying_layout:
             dbg('notify_resize: suppressed (applying_layout)')
+            if self.handlers and not getattr(
+                    self, '_layout_clear_scheduled', False):
+                self._layout_clear_scheduled = True
+                tree = getattr(self.handlers,
+                               '_pending_layout_tree', None)
+                from gi.repository import GLib
+                GLib.idle_add(
+                    self._do_finish_applying_layout, tree,
+                    priority=GLib.PRIORITY_DEFAULT_IDLE + 10)
             return
 
         def do_resize():
@@ -562,6 +575,18 @@ class TmuxController:
             return False
 
         do_resize()
+
+    def _do_finish_applying_layout(self, tree):
+        """Clear _applying_layout after all VTE size-allocate callbacks.
+
+        Scheduled at priority DEFAULT_IDLE+10 (210) from notify_resize,
+        so it runs after ALL terminals' deferred notify_resize callbacks
+        (at priority 200) have been suppressed.
+        """
+        self._layout_clear_scheduled = False
+        if self.handlers:
+            self.handlers._finish_applying_layout(tree)
+        return False
 
     def _do_arm_tripwire(self):
         """Set max to the next character boundary so we can detect

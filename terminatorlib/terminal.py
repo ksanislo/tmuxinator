@@ -1703,10 +1703,13 @@ class Terminal(Gtk.VBox):
         self.titlebar.update_terminal_size(self.vte.get_column_count(),
                 self.vte.get_row_count())
         if self.tmux_pane_id is not None and self._tmux_controller:
-            # Tmux mode: always set char-grid increment hints so the
-            # WM snaps to character boundaries during resize.
+            # Tmux mode: set char-grid increment hints so the WM snaps
+            # to character boundaries during resize.  Skip during
+            # layout application — per-terminal hints set wrong BASE
+            # values with splits, causing the WM to snap-shrink.
             window = self.get_toplevel()
-            window.set_tmux_geometry_hints(self)
+            if not self._tmux_controller._applying_layout:
+                window.set_tmux_geometry_hints(self)
             self._tmux_controller.notify_resize(self,
                 self.vte.get_column_count(), self.vte.get_row_count())
         elif self.config['geometry_hinting']:
@@ -2069,12 +2072,12 @@ class Terminal(Gtk.VBox):
                 VPaned._char_snap = char_h
                 css = (
                     'paned {{'
-                    '  -GtkPaned-handle-size: {w};'
+                    '  -GtkPaned-handle-size: {h};'
                     '}}'
                     'vte-terminal {{'
                     '  padding: 0;'
                     '}}'
-                ).format(w=char_w)
+                ).format(h=char_w)
                 provider = Gtk.CssProvider()
                 provider.load_from_data(css.encode('utf-8'))
                 Gtk.StyleContext.add_provider_for_screen(

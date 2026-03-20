@@ -264,6 +264,11 @@ class Paned(Container):
 
     def get_handlesize(self):
         """Why oh why, gtk3?"""
+        # Tmux-managed paneds use a known handle size to avoid
+        # the deprecated style property returning wrong values.
+        tmux_hs = getattr(self, '_tmux_handle_size', None)
+        if tmux_hs is not None:
+            return tmux_hs
         try:
             value = GObject.Value(int)
             self.style_get_property('handle-size',  value)
@@ -531,6 +536,10 @@ class HPaned(Paned, Gtk.HPaned):
         snap = HPaned._char_snap
         if self._snapping or snap <= 0:
             return
+        # Skip snap for tmux-managed paneds — tmux controls layout
+        # via _apply_ratios and snap fights due to handle gap mismatch
+        if getattr(self, '_tmux_managed', False):
+            return
         pos = self.get_position()
         gap = self._measured_gap if self._measured_gap else self.get_handlesize()
         n = round((pos + gap) / snap)
@@ -582,6 +591,9 @@ class VPaned(Paned, Gtk.VPaned):
         """Snap handle so child2 starts at a character cell boundary."""
         snap = VPaned._char_snap
         if self._snapping or snap <= 0:
+            return
+        # Skip snap for tmux-managed paneds
+        if getattr(self, '_tmux_managed', False):
             return
         pos = self.get_position()
         gap = self._measured_gap if self._measured_gap else self.get_handlesize()
