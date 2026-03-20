@@ -574,6 +574,9 @@ class TmuxController:
         axes get screen-max so the user can freely resize them."""
         if (self._tmux_max_cols is None and self._tmux_max_rows is None) \
                 or not self.handlers:
+            # No constraints — clear any stale MAX hint
+            if self.handlers:
+                self.handlers._clear_tmux_max_size()
             return False
         # For constrained axes, probe +1 char beyond the limit.
         # For unconstrained axes, use current tree size (no limit).
