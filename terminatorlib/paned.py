@@ -264,11 +264,6 @@ class Paned(Container):
 
     def get_handlesize(self):
         """Why oh why, gtk3?"""
-        # Tmux-managed paneds use a known handle size to avoid
-        # the deprecated style property returning wrong values.
-        tmux_hs = getattr(self, '_tmux_handle_size', None)
-        if tmux_hs is not None:
-            return tmux_hs
         try:
             value = GObject.Value(int)
             self.style_get_property('handle-size',  value)
@@ -479,6 +474,11 @@ class Paned(Container):
             children[1].rotate_recursive(container, w2, h2, clockwise)
 
     def new_size(self, widget, allocation):
+        # Tmux-managed paneds: position is controlled by
+        # _apply_ratios and the do_size_allocate anchor.
+        # Don't bake in GTK's potentially rescaled position.
+        if getattr(self, '_tmux_managed', False):
+            return
         if self.get_toplevel().set_pos_by_ratio:
             self.set_position_by_ratio()
         else:
@@ -581,9 +581,21 @@ class HPaned(Paned, Gtk.HPaned):
                 self._tmux_prev_len = new_len
                 handle = self.get_handlesize()
                 new_pos = max(new_len - child2_px - handle, 0)
-                if new_pos != self.get_position():
+                old_pos = self.get_position()
+                dbg('HPaned anchor: alloc=%dx%d '
+                    'prev=%d new=%d child2=%d '
+                    'handle=%d pos %d->%d' % (
+                    allocation.width, allocation.height,
+                    prev_len, new_len, child2_px,
+                    handle, old_pos, new_pos))
+                if new_pos != old_pos:
                     Gtk.HPaned.set_position(self, new_pos)
                     self.set_property('position-set', True)
+            else:
+                dbg('HPaned alloc: %dx%d (unchanged, '
+                    'pos=%d child2=%d)' % (
+                    allocation.width, allocation.height,
+                    self.get_position(), child2_px))
         Gtk.HPaned.do_size_allocate(self, allocation)
 
     def get_length(self):
@@ -658,9 +670,21 @@ class VPaned(Paned, Gtk.VPaned):
                 self._tmux_prev_len = new_len
                 handle = self.get_handlesize()
                 new_pos = max(new_len - child2_px - handle, 0)
-                if new_pos != self.get_position():
+                old_pos = self.get_position()
+                dbg('VPaned anchor: alloc=%dx%d '
+                    'prev=%d new=%d child2=%d '
+                    'handle=%d pos %d->%d' % (
+                    allocation.width, allocation.height,
+                    prev_len, new_len, child2_px,
+                    handle, old_pos, new_pos))
+                if new_pos != old_pos:
                     Gtk.VPaned.set_position(self, new_pos)
                     self.set_property('position-set', True)
+            else:
+                dbg('VPaned alloc: %dx%d (unchanged, '
+                    'pos=%d child2=%d)' % (
+                    allocation.width, allocation.height,
+                    self.get_position(), child2_px))
         Gtk.VPaned.do_size_allocate(self, allocation)
 
     def get_length(self):

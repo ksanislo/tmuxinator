@@ -346,39 +346,43 @@ class TmuxHandlers:
         dbg('_finish_applying_layout: clearing _applying_layout')
         self.controller._applying_layout = False
         self.controller._layout_applied_time = time.monotonic()
-        if self.controller._last_client_size is not None:
-            # Check if VTE size changed while suppressed — if so,
-            # send refresh-client so tmux knows the new size.
-            new_cols, new_rows = \
-                self.controller._calculate_client_size()
-            if (new_cols > 0 and new_rows > 0
-                    and (new_cols, new_rows)
-                    != self.controller._last_client_size):
-                size = (new_cols, new_rows)
-                dbg('_finish_applying_layout: client size '
-                    'changed %dx%d -> %dx%d' % (
-                    self.controller._last_client_size[0],
-                    self.controller._last_client_size[1],
-                    new_cols, new_rows))
-                self.controller._last_client_size = size
-                self.controller.protocol.send_command(
-                    'refresh-client -C {},{}'.format(
-                        new_cols, new_rows))
-                self.controller._layout_applied_time = \
-                    time.monotonic()
+        initial = self.controller._last_client_size is None
+        if not initial:
+            # We just applied a layout from tmux — the tree
+            # dimensions ARE the authoritative client size.
+            # Don't use _calculate_client_size() here: VTE pixel
+            # rounding means the sum of VTE chars can exceed the
+            # tree, triggering a grow loop (tree→VTE→bigger
+            # refresh-client→bigger tree→repeat).
+            if tree and tree.width > 0 and tree.height > 0:
+                size = (tree.width, tree.height)
+                if size != self.controller._last_client_size:
+                    dbg('_finish_applying_layout: client size '
+                        'changed %dx%d -> %dx%d (from tree)' % (
+                        self.controller._last_client_size[0],
+                        self.controller._last_client_size[1],
+                        size[0], size[1]))
+                    self.controller._last_client_size = size
+                    self.controller.protocol.send_command(
+                        'refresh-client -C {},{}'.format(
+                            size[0], size[1]))
+                    self.controller._layout_applied_time = \
+                        time.monotonic()
             self._snapshot_vte_sizes()
         else:
-            # Initial startup: no notify_resize has run yet.
-            # Calculate and send the client size ourselves so tmux
-            # knows our dimensions and initial captures can fire.
-            cols, rows = self.controller._calculate_client_size()
+            # Initial startup: VTE hasn't settled into the
+            # resized window yet — paned position changes from
+            # _apply_ratios are still pending allocation.
+            # Skip reconcile; the natural flow (VTE settles →
+            # notify_resize → do_resize → refresh-client →
+            # layout-change) will converge without it.
+            cols = tree.width if tree else 0
+            rows = tree.height if tree else 0
             if cols > 0 and rows > 0:
                 size = (cols, rows)
                 self.controller._last_client_size = size
                 dbg('_finish_applying_layout: initial '
-                    'refresh-client -C %d,%d' % (cols, rows))
-                self.controller.protocol.send_command(
-                    'refresh-client -C {},{}'.format(cols, rows))
+                    'client size %d,%d (from tree)' % (cols, rows))
                 self.controller._refresh_layout_state()
                 if self._initial_capture_pending:
                     self._initial_capture_pending = False
@@ -412,8 +416,11 @@ class TmuxHandlers:
                 pass
             break
 
-        if not chrome_changed:
-            self._schedule_reconcile(tree)
+        # No reconcile — refresh-client -C tells tmux the correct
+        # total size; tmux distributes panes.  Reconcile's per-pane
+        # resize-pane commands caused a feedback loop (resize-pane →
+        # layout-change → reconcile → resize-pane → ...) that made
+        # pane proportions jump during window resize.
         return False  # don't repeat
 
     def _snapshot_vte_sizes(self):
@@ -430,28 +437,31 @@ class TmuxHandlers:
                 pass
 
     def _schedule_reconcile(self, tree):
-        """Schedule a deferred reconciliation of pane sizes with tmux.
+        """Schedule reconciliation after all pending allocations.
 
-        After ratio application, GTK's pixel rounding may cause VTE sizes
-        to differ from what tmux expects. This sends resize-pane commands
-        to sync tmux with the actual VTE sizes. Runs after the 0.3s
-        suppression window so notify_resize won't interfere.
+        Uses idle priority below _finish_applying_layout (210) so
+        VTE size-allocate handlers have already run by the time
+        reconcile executes — no timer race.
         """
         if self._reconcile_timer:
             GLib.source_remove(self._reconcile_timer)
-        self._reconcile_timer = GLib.timeout_add(
-            500, self._reconcile_pane_sizes, tree)
+        self._reconcile_timer = GLib.idle_add(
+            self._reconcile_pane_sizes, tree,
+            priority=GLib.PRIORITY_DEFAULT_IDLE + 20)
 
     def _reconcile_pane_sizes(self, tree):
-        """Send resize-pane for any pane where VTE size differs from tmux."""
+        """Send resize-pane for any pane where VTE is smaller than tmux."""
         import time
         self._reconcile_timer = None
         client_size = self.controller._last_client_size
         dbg('reconcile: tree=%dx%d client=%s' % (
             tree.width, tree.height, client_size))
-        if client_size and (tree.width > client_size[0] or tree.height > client_size[1]):
-            dbg('reconcile: skipping — layout %dx%d exceeds client %dx%d' % (
-                tree.width, tree.height, client_size[0], client_size[1]))
+        if client_size and (tree.width > client_size[0]
+                            or tree.height > client_size[1]):
+            dbg('reconcile: skipping — layout %dx%d '
+                'exceeds client %dx%d' % (
+                tree.width, tree.height,
+                client_size[0], client_size[1]))
             return False
 
         mismatches = []
@@ -464,10 +474,13 @@ class TmuxHandlers:
             dbg('  %s: vte=%dx%d tmux=%dx%d' % (
                 pane_id, vte_cols, vte_rows, tmux_cols, tmux_rows))
             parts = ['resize-pane -t {}'.format(pane_id)]
-            if vte_cols != tmux_cols:
+            # Only shrink axes — never grow tmux panes
+            if vte_cols < tmux_cols:
                 parts.append('-x {}'.format(vte_cols))
-            if vte_rows != tmux_rows:
+            if vte_rows < tmux_rows:
                 parts.append('-y {}'.format(vte_rows))
+            if len(parts) == 1:
+                continue  # nothing to shrink
             cmd = ' '.join(parts)
             dbg('reconcile: %s' % cmd)
             self.protocol.send_command(cmd)
@@ -484,16 +497,24 @@ class TmuxHandlers:
         return False
 
     def _collect_mismatches(self, node, out):
-        """Collect panes where VTE size differs from tmux's expected size."""
+        """Collect panes where VTE is smaller than tmux expects.
+
+        Only shrink direction: if VTE has fewer cols/rows than
+        tmux's tree, report it so tmux can reallocate.  Never
+        report VTE > tmux — that's pixel rounding slack and
+        growing tmux panes causes a feedback loop.
+        """
         if node.is_leaf:
             terminal = self.controller.pane_to_terminal.get(node.pane_id)
             if terminal:
                 try:
                     vte_cols = terminal.vte.get_column_count()
                     vte_rows = terminal.vte.get_row_count()
-                    if vte_cols != node.width or vte_rows != node.height:
-                        out.append((node.pane_id, vte_cols, vte_rows,
-                                    node.width, node.height))
+                    if (vte_cols < node.width
+                            or vte_rows < node.height):
+                        out.append((node.pane_id, vte_cols,
+                                    vte_rows, node.width,
+                                    node.height))
                 except Exception:
                     pass
         else:
@@ -560,15 +581,21 @@ class TmuxHandlers:
                 break
 
             # Mark as tmux-managed (disables snap fighting).
-            # Set handle size to match tmux's 1-character separator.
-            # GTK still renders its real handle (e.g. 9px), but our
-            # position math uses char_sep so left_px + right_px +
-            # char_sep = _subtree_px total.  Without this, the 9px
-            # difference per nested separator compounds into dead
-            # space that inflates VTE character counts.
-            char_sep = char_w if orient == 'h' else char_h
             paned._tmux_managed = True
-            paned._tmux_handle_size = char_sep
+
+            # Tell GTK to keep child1 at its set position when
+            # the paned is resized — don't proportionally rescale.
+            # Without this, gtk_paned_calc_position does
+            # pos = new_alloc * old_pos / old_alloc, which negates
+            # any position we set in do_size_allocate.
+            child1 = paned.get_child1()
+            child2 = paned.get_child2()
+            if child1:
+                paned.child_set_property(
+                    child1, 'resize', False)
+            if child2:
+                paned.child_set_property(
+                    child2, 'resize', True)
 
             handle_size = paned.get_handlesize()
             paned_len = paned.get_length()
@@ -593,21 +620,72 @@ class TmuxHandlers:
                 sep = char_w if orient == 'h' else char_h
                 right_px += (len(remaining) - 2) * sep
 
+            # Log tree node dimensions vs paned allocation
+            left_node = remaining[0]
+            right_nodes = remaining[1:]
+            left_dim = ('%dx%d' % (left_node.width,
+                                    left_node.height)
+                        if left_node.is_leaf
+                        else '%s(%dx%d)' % (
+                            left_node.orientation,
+                            left_node.width,
+                            left_node.height))
+            right_dim = ','.join(
+                ('%dx%d' % (c.width, c.height)
+                 if c.is_leaf
+                 else '%s(%dx%d)' % (
+                     c.orientation, c.width, c.height))
+                for c in right_nodes)
+            total_needed = left_px + right_px + handle_size
+            stale = total_needed > paned_len + handle_size
+            dbg('ratio tree: left=[%s] right=[%s] '
+                'need=%dpx paned=%dpx %s' % (
+                left_dim, right_dim,
+                total_needed, paned_len,
+                'STALE' if stale else 'ok'))
+
             # Anchor child2 at its exact target pixel size so that
             # only child1 (the pane bordering the handle) absorbs
             # size changes — the far pane stays fixed.  The gap
             # between the real handle and a full character cell
             # naturally becomes dead space in child1.
-            target_pos = paned_len - right_px - handle_size
-            if target_pos < 0:
-                target_pos = 0
+            #
+            # When the paned is stale (not yet allocated at the
+            # new window size), use proportional positioning so
+            # the split looks approximately correct while waiting
+            # for the anchor to fix it on the next allocation.
+            if stale and total_needed > 0:
+                ratio = left_px / float(total_needed)
+                usable = paned_len - handle_size
+                target_pos = max(0, int(ratio * usable))
+            else:
+                target_pos = paned_len - right_px - handle_size
+                if target_pos < 0:
+                    target_pos = 0
 
             # Detect if user is actively dragging THIS handle:
             # mouse button held + position differs from last sync
             # + length unchanged (not a parent reallocation).
+            #
+            # GTK3 button-release may not fire reliably on paneds,
+            # so verify actual pointer state when flag is set.
             synced = getattr(paned, '_tmux_synced_pos', None)
             prev_len = getattr(paned, '_tmux_prev_len', None)
             cur_pos = paned.get_position()
+            if getattr(paned, '_tmux_handle_pressed', False):
+                try:
+                    from gi.repository import Gdk
+                    seat = paned.get_display().get_default_seat()
+                    ptr = seat.get_pointer()
+                    win = paned.get_window()
+                    if win and ptr:
+                        _, _, _, mask = \
+                            win.get_device_position(ptr)
+                        if not (mask
+                                & Gdk.ModifierType.BUTTON1_MASK):
+                            paned._tmux_handle_pressed = False
+                except Exception:
+                    pass
             user_dragging = (getattr(paned,
                                  '_tmux_handle_pressed', False)
                              and synced is not None
@@ -619,10 +697,28 @@ class TmuxHandlers:
             # dragged — this paned's total size is changing
             # due to the parent drag, so let do_size_allocate
             # anchor handle it instead of overriding here.
+            # Uses the same pointer-state verification as above.
             ancestor_dragging = False
             w = paned.get_parent()
             while w is not None:
                 if getattr(w, '_tmux_handle_pressed', False):
+                    # Verify button is actually held
+                    try:
+                        from gi.repository import Gdk
+                        seat = w.get_display().get_default_seat()
+                        ptr = seat.get_pointer()
+                        wn = w.get_window()
+                        if wn and ptr:
+                            _, _, _, mask = \
+                                wn.get_device_position(ptr)
+                            if not (mask
+                                    & Gdk.ModifierType
+                                    .BUTTON1_MASK):
+                                w._tmux_handle_pressed = False
+                                w = w.get_parent()
+                                continue
+                    except Exception:
+                        pass
                     ancestor_dragging = True
                     break
                 w = w.get_parent()
@@ -1480,6 +1576,13 @@ class TmuxHandlers:
         # window resize (not a split drag) when VTE sizes change
         self.controller._last_window_pixels = (win_w, win_h)
         self.controller._layout_applied_time = time.monotonic()
+        # If window isn't already at target size, the WM hasn't
+        # processed the resize yet.  Gate _finish_applying_layout
+        # on configure-event so we don't clear _applying_layout
+        # while paneds are still at old size.
+        if ws != (win_w, win_h):
+            self.controller._window_resize_pending = True
+            self.controller._ensure_configure_handler(window)
         return False
 
     def _send_initial_resize(self):
@@ -1624,7 +1727,13 @@ class TmuxHandlers:
             win_w, win_h,
             max_w, max_h, fits))
 
+        ws_before = window.get_size()
         window.resize(win_w, win_h)
+
+        # Gate _finish_applying_layout on the WM's response
+        if ws_before != (win_w, win_h):
+            self.controller._window_resize_pending = True
+            self.controller._ensure_configure_handler(window)
 
         # Set initial chrome baseline for change detection
         self.controller._last_chrome = self._get_chrome_size(window)

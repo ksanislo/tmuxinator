@@ -840,9 +840,10 @@ class Window(Container, Gtk.Window):
                 else:
                     chrome_w = chrome_h = 0
             else:
-                ta = terminal.get_allocation()
-                chrome_w = max(0, ca.width - ta.width)
-                chrome_h = max(0, ca.height - ta.height)
+                # No notebook — content is the paned/terminal
+                # directly, so there's no chrome (no tab bar,
+                # no notebook borders).
+                chrome_w = chrome_h = 0
             base_w = csd_w + chrome_w
             base_h = csd_h + chrome_h
 

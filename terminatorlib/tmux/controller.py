@@ -103,6 +103,8 @@ class TmuxController:
         self.handlers = None
         self._last_client_size = None
         self._last_window_pixels = None
+        self._window_resize_pending = False  # True after window.resize() until WM responds
+        self._configure_handler_id = None
         self._last_chrome = None  # (w, h) content-term chrome
         self.active_window_id = None  # @id of tmux's active window
         self._pending_output = {}  # pane_id -> [data, ...] for pre-registration %output
@@ -395,14 +397,23 @@ class TmuxController:
         # priority 210 — this runs after ALL pending notify_resize
         # callbacks (priority 200) have been suppressed.
         if self._applying_layout:
-            dbg('notify_resize: suppressed (applying_layout)')
-            if self.handlers and not getattr(
-                    self, '_layout_clear_scheduled', False):
-                self._layout_clear_scheduled = True
+            dbg('notify_resize: suppressed (applying_layout'
+                ' resize_pending=%s)' %
+                self._window_resize_pending)
+            if self.handlers and not self._window_resize_pending:
+                # Window has reached target size (or no resize
+                # was requested).  Reschedule on every suppressed
+                # call — defers clearing until after the LAST VTE
+                # settles, including anchor corrections from
+                # STALE paneds catching up to their real size.
+                from gi.repository import GLib
+                src = getattr(self, '_layout_clear_source',
+                              None)
+                if src:
+                    GLib.source_remove(src)
                 tree = getattr(self.handlers,
                                '_pending_layout_tree', None)
-                from gi.repository import GLib
-                GLib.idle_add(
+                self._layout_clear_source = GLib.idle_add(
                     self._do_finish_applying_layout, tree,
                     priority=GLib.PRIORITY_DEFAULT_IDLE + 10)
             return
@@ -455,20 +466,21 @@ class TmuxController:
             for t in self.terminal_to_pane:
                 try:
                     top = t.get_toplevel()
-                    alloc = top.get_allocation()
-                    px = (alloc.width, alloc.height)
+                    px = top.get_size()
                     if px != self._last_window_pixels:
                         dbg('window pixels changed %s -> %s' % (self._last_window_pixels, px))
                         window_resized = True
                         self._last_window_pixels = px
                     # Check if we hit the tripwire boundary
-                    # Only check constrained axes
+                    # Tripwire is in allocation space (includes CSD)
+                    alloc = top.get_allocation()
+                    apx = (alloc.width, alloc.height)
                     if (self._tripwire_armed and self._tripwire_pixels
-                            and px):
+                            and apx):
                         hit_w = (self._tmux_max_cols is not None
-                                 and px[0] >= self._tripwire_pixels[0])
+                                 and apx[0] >= self._tripwire_pixels[0])
                         hit_h = (self._tmux_max_rows is not None
-                                 and px[1] >= self._tripwire_pixels[1])
+                                 and apx[1] >= self._tripwire_pixels[1])
                         if hit_w or hit_h:
                             tripwire_hit = True
                     break
@@ -580,14 +592,38 @@ class TmuxController:
     def _do_finish_applying_layout(self, tree):
         """Clear _applying_layout after all VTE size-allocate callbacks.
 
-        Scheduled at priority DEFAULT_IDLE+10 (210) from notify_resize,
-        so it runs after ALL terminals' deferred notify_resize callbacks
-        (at priority 200) have been suppressed.
+        Scheduled at priority DEFAULT_IDLE+10 (210) from notify_resize.
+        Rescheduled on every suppressed notify_resize, so it only
+        fires after the LAST VTE settles (including anchor cascades).
         """
-        self._layout_clear_scheduled = False
+        self._layout_clear_source = None
         if self.handlers:
             self.handlers._finish_applying_layout(tree)
         return False
+
+    def _ensure_configure_handler(self, window):
+        """Connect configure-event handler once per window."""
+        if not self._configure_handler_id:
+            self._configure_handler_id = window.connect(
+                'configure-event',
+                self._on_configure_event)
+
+    def _on_configure_event(self, window, event):
+        """WM responded to a window resize request.
+
+        Clears _window_resize_pending so the suppressed notify_resize
+        path can schedule _finish_applying_layout.  The allocation
+        cascade from this configure-event will trigger VTE
+        size-allocate → notify_resize → idle schedule.
+        """
+        if self._window_resize_pending:
+            self._window_resize_pending = False
+            self._last_window_pixels = window.get_size()
+            dbg('configure-event: resize complete, '
+                'size=%s applying=%s' % (
+                self._last_window_pixels,
+                self._applying_layout))
+        return False  # propagate
 
     def _do_arm_tripwire(self):
         """Set max to the next character boundary so we can detect

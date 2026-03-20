@@ -197,7 +197,8 @@ class Terminator(Borg):
                 return window
         return None
 
-    def new_window(self, cwd=None, profile=None):
+    def new_window(self, cwd=None, profile=None,
+                   tmux_size=None):
         """Create a window with a Terminal in it"""
         maker = Factory()
         window = maker.make('Window')
@@ -207,7 +208,25 @@ class Terminator(Borg):
         if profile and self.config['always_split_with_profile']:
             terminal.force_set_profile(None, profile)
         window.add(terminal)
+        if tmux_size:
+            # Realize the widget hierarchy so VTE can report
+            # real font metrics before showing the window.
+            window.realize()
+            cw = terminal.vte.get_char_width()
+            ch = terminal.vte.get_char_height()
+            if cw > 0 and ch > 0:
+                cols, rows = tmux_size
+                w, h = cols * cw, rows * ch
+                window.set_default_size(w, h)
+                dbg('pre-size: tmux=%dx%d char=%dx%d '
+                    'default=%dx%d' % (
+                    cols, rows, cw, ch, w, h))
         window.show(True)
+        if tmux_size:
+            # Process events so the WM maps the window at
+            # the requested size before splits are created.
+            while Gtk.events_pending():
+                Gtk.main_iteration_do(False)
         terminal.spawn_child()
         terminal.emit('tab-change', 0)
 
@@ -360,38 +379,50 @@ class Terminator(Borg):
             if layout[windef]['type'] != 'Window':
                 err('invalid layout format. %s' % layout)
                 raise(ValueError)
-            window, terminal = self.new_window()
-            window.create_layout(layout[windef])
+            # Pass tmux_size so new_window can realize the VTE,
+            # get real font metrics, and set_default_size before
+            # showing — paneds are born at the correct size.
+            tmux_size = None
             if 'tmux_size' in layout[windef]:
-                # Resize AFTER create_layout so Notebook/tabs exist.
-                # Both happen before GTK main loop = atomic layout.
-                # Use preferred heights to probe tab chrome since
-                # allocations aren't available yet.
                 size = layout[windef]['tmux_size']
-                cols, rows = int(size[0]), int(size[1])
-                cw = terminal.vte.get_char_width() or 10
-                ch = terminal.vte.get_char_height() or 18
-                target_w = cols * cw
-                target_h = rows * ch
-                chrome_w = 0
-                chrome_h = 0
-                content = window.get_child()
-                if content:
-                    _, content_nat_w = content.get_preferred_width()
-                    _, content_nat_h = content.get_preferred_height()
-                    terms = window.get_terminals()
-                    if terms:
-                        t = terms[0]
-                        _, term_nat_w = t.get_preferred_width()
-                        _, term_nat_h = t.get_preferred_height()
-                        chrome_w = max(0, content_nat_w - term_nat_w)
-                        chrome_h = max(0, content_nat_h - term_nat_h)
-                dbg('pre-resize: tmux=%dx%d char=%dx%d '
-                    'target=%dx%d chrome=%dx%d' % (
-                    cols, rows, cw, ch,
-                    target_w, target_h, chrome_w, chrome_h))
-                window.resize(target_w + chrome_w,
-                              target_h + chrome_h)
+                tmux_size = (int(size[0]), int(size[1]))
+            window, terminal = self.new_window(
+                tmux_size=tmux_size)
+            window.create_layout(layout[windef])
+            if tmux_size:
+                # Resize with real char metrics + chrome.
+                cw = terminal.vte.get_char_width()
+                ch = terminal.vte.get_char_height()
+                if cw > 0 and ch > 0:
+                    cols, rows = tmux_size
+                    target_w = cols * cw
+                    target_h = rows * ch
+                    chrome_w = 0
+                    chrome_h = 0
+                    content = window.get_child()
+                    if content and \
+                            hasattr(content, 'get_current_page'):
+                        page_num = content.get_current_page()
+                        if page_num >= 0:
+                            page = content.get_nth_page(
+                                page_num)
+                            _, cnt_w = \
+                                content.get_preferred_width()
+                            _, cnt_h = \
+                                content.get_preferred_height()
+                            _, pg_w = \
+                                page.get_preferred_width()
+                            _, pg_h = \
+                                page.get_preferred_height()
+                            chrome_w = max(0, cnt_w - pg_w)
+                            chrome_h = max(0, cnt_h - pg_h)
+                    dbg('pre-resize: tmux=%dx%d char=%dx%d '
+                        'target=%dx%d chrome=%dx%d' % (
+                        cols, rows, cw, ch,
+                        target_w, target_h,
+                        chrome_w, chrome_h))
+                    window.resize(target_w + chrome_w,
+                                  target_h + chrome_h)
 
         self.layoutname = 'tmux'
 
