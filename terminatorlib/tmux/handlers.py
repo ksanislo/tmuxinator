@@ -70,6 +70,25 @@ class TmuxHandlers:
             dbg('TmuxHandlers: feed error: %s' % e)
         return False
 
+    def _get_chrome_size(self, window):
+        """Compute chrome pixels (tab bar, borders) excluding pane area.
+
+        Chrome = content_allocation - notebook_page_allocation.
+        Using the notebook page (not a terminal) avoids counting
+        other panes as chrome when splits are present.
+        """
+        content = window.get_child()
+        if not content:
+            return 0, 0
+        ca = content.get_allocation()
+        if hasattr(content, 'get_current_page'):
+            page_num = content.get_current_page()
+            if page_num >= 0:
+                page = content.get_nth_page(page_num)
+                pa = page.get_allocation()
+                return ca.width - pa.width, ca.height - pa.height
+        return 0, 0
+
     def _find_tmux_window(self, terminator):
         """Find the Terminator window that contains this controller's terminals."""
         for window in terminator.windows:
@@ -1022,13 +1041,8 @@ class TmuxHandlers:
 
         window = term.get_toplevel()
 
-        # Chrome = content area minus terminal widget (tab bar, borders).
-        # Do NOT use ws-vte — VTE allocation is stale at startup.
-        content = window.get_child()
-        ca = content.get_allocation() if content else None
-        ta = term.get_allocation()
-        chrome_w = (ca.width - ta.width) if ca else 0
-        chrome_h = (ca.height - ta.height) if ca else 0
+        # Chrome = tab bar, borders — NOT other panes.
+        chrome_w, chrome_h = self._get_chrome_size(window)
 
         max_w = int(target_w) + chrome_w
         max_h = int(target_h) + chrome_h
@@ -1185,13 +1199,9 @@ class TmuxHandlers:
                                      handle_size, vpad_x, vpad_y)
 
         window = term.get_toplevel()
-        # Chrome = content-to-terminal (tab bar, borders).
+        # Chrome = tab bar, borders — NOT other panes.
         # window.resize() operates in content space — no CSD.
-        content = window.get_child()
-        ca = content.get_allocation() if content else None
-        ta = term.get_allocation()
-        chrome_w = (ca.width - ta.width) if ca else 0
-        chrome_h = (ca.height - ta.height) if ca else 0
+        chrome_w, chrome_h = self._get_chrome_size(window)
 
         win_w = int(target_w) + chrome_w
         win_h = int(target_h) + chrome_h
@@ -1199,11 +1209,9 @@ class TmuxHandlers:
         wa = window.get_allocation()
         ws = window.get_size()
         dbg('size_trace resize_to_tree: '
-            'alloc=%dx%d ws=%dx%d content=%s term=%dx%d '
+            'alloc=%dx%d ws=%dx%d '
             'chrome=%dx%d resize=%dx%d tree=%dx%d' % (
             wa.width, wa.height, ws[0], ws[1],
-            '%dx%d' % (ca.width, ca.height) if ca else 'None',
-            ta.width, ta.height,
             chrome_w, chrome_h, win_w, win_h,
             tree.width, tree.height))
 
@@ -1308,11 +1316,10 @@ class TmuxHandlers:
             chrome_alloc_vte[0], chrome_alloc_vte[1],
             chrome_content_term[0], chrome_content_term[1]))
 
-        # Chrome = content-to-terminal only (tab bar etc).
+        # Chrome = tab bar, borders — NOT other panes.
         # window.resize() operates in content space (get_size()),
         # NOT allocation space — do NOT add CSD.
-        chrome_w = chrome_content_term[0]
-        chrome_h = chrome_content_term[1]
+        chrome_w, chrome_h = self._get_chrome_size(window)
 
         # Get screen limits
         from gi.repository import Gdk
@@ -1340,7 +1347,7 @@ class TmuxHandlers:
         window.resize(win_w, win_h)
 
         # Set initial chrome baseline for change detection
-        self.controller._last_chrome = (chrome_w, chrome_h)
+        self.controller._last_chrome = self._get_chrome_size(window)
 
         # Check what happened after resize
         wa2 = window.get_allocation()

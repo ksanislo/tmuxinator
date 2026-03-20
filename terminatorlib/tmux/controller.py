@@ -409,12 +409,8 @@ class TmuxController:
             for t in self.terminal_to_pane:
                 try:
                     top = t.get_toplevel()
-                    content = top.get_child()
-                    if content and self._last_chrome is not None:
-                        ca = content.get_allocation()
-                        ta = t.get_allocation()
-                        chrome = (ca.width - ta.width,
-                                  ca.height - ta.height)
+                    if self.handlers and self._last_chrome is not None:
+                        chrome = self.handlers._get_chrome_size(top)
                         if chrome != self._last_chrome:
                             delta_w = chrome[0] - self._last_chrome[0]
                             delta_h = chrome[1] - self._last_chrome[1]
