@@ -76,6 +76,9 @@ class TmuxHandlers:
         Chrome = content_allocation - notebook_page_allocation.
         Using the notebook page (not a terminal) avoids counting
         other panes as chrome when splits are present.
+
+        Falls back to preferred sizes when allocations aren't
+        available yet (before GTK's first layout pass).
         """
         content = window.get_child()
         if not content:
@@ -86,7 +89,16 @@ class TmuxHandlers:
             if page_num >= 0:
                 page = content.get_nth_page(page_num)
                 pa = page.get_allocation()
-                return ca.width - pa.width, ca.height - pa.height
+                cw = ca.width - pa.width
+                ch = ca.height - pa.height
+                if cw > 0 or ch > 0:
+                    return cw, ch
+                # Allocations not ready — use preferred sizes
+                _, cnt_w = content.get_preferred_width()
+                _, cnt_h = content.get_preferred_height()
+                _, pg_w = page.get_preferred_width()
+                _, pg_h = page.get_preferred_height()
+                return max(0, cnt_w - pg_w), max(0, cnt_h - pg_h)
         return 0, 0
 
     def _find_tmux_window(self, terminator):
@@ -258,6 +270,7 @@ class TmuxHandlers:
         deferred = False
         try:
             self._record_tmux_sizes(tree)
+            self._ratios_changed = False
             if not tree.is_leaf:
                 self._needs_ratio_retry = False
                 self._apply_ratios(tree)
@@ -268,16 +281,19 @@ class TmuxHandlers:
         finally:
             if not deferred:
                 import time
-                # Set _layout_applied_time so notify_resize passes the
-                # initial gate check, but keep _applying_layout True.
-                # The flag is cleared reactively by notify_resize itself
-                # (via _finish_applying_layout at priority 210) — this
-                # guarantees the clearing happens AFTER the GTK frame
-                # clock has processed allocations and VTE size-allocate
-                # callbacks have been queued.  Idle-based clearing from
-                # here fires before the frame clock and is too early.
                 self.controller._layout_applied_time = time.monotonic()
-                self._pending_layout_tree = tree
+                if self._ratios_changed:
+                    # Ratios changed → VTE allocations will change →
+                    # notify_resize will fire and clear the flag
+                    # reactively via _finish_applying_layout.
+                    self._pending_layout_tree = tree
+                else:
+                    # No ratios changed (single pane or same layout).
+                    # No VTE allocations will change, so nothing will
+                    # trigger _finish_applying_layout.  Defer to idle
+                    # so GTK can process pending allocations (e.g.
+                    # notebook tab bar) before the chrome check runs.
+                    GLib.idle_add(self._finish_applying_layout, tree)
         return False
 
     def _apply_ratios_and_finish(self, tree):
@@ -287,6 +303,7 @@ class TmuxHandlers:
         providing continuous suppression of resize echo-back.
         """
         self._needs_ratio_retry = False
+        self._ratios_changed = False
         try:
             self._apply_ratios(tree)
             if self._needs_ratio_retry:
@@ -297,9 +314,10 @@ class TmuxHandlers:
             pass
         import time
         self.controller._layout_applied_time = time.monotonic()
-        self._pending_layout_tree = tree
-        # _applying_layout stays True — cleared reactively by
-        # notify_resize via _finish_applying_layout.
+        if self._ratios_changed:
+            self._pending_layout_tree = tree
+        else:
+            GLib.idle_add(self._finish_applying_layout, tree)
         return False
 
     def _finish_applying_layout(self, tree):
@@ -317,6 +335,25 @@ class TmuxHandlers:
         self.controller._applying_layout = False
         self.controller._layout_applied_time = time.monotonic()
         if self.controller._last_client_size is not None:
+            # Check if VTE size changed while suppressed — if so,
+            # send refresh-client so tmux knows the new size.
+            new_cols, new_rows = \
+                self.controller._calculate_client_size()
+            if (new_cols > 0 and new_rows > 0
+                    and (new_cols, new_rows)
+                    != self.controller._last_client_size):
+                size = (new_cols, new_rows)
+                dbg('_finish_applying_layout: client size '
+                    'changed %dx%d -> %dx%d' % (
+                    self.controller._last_client_size[0],
+                    self.controller._last_client_size[1],
+                    new_cols, new_rows))
+                self.controller._last_client_size = size
+                self.controller.protocol.send_command(
+                    'refresh-client -C {},{}'.format(
+                        new_cols, new_rows))
+                self.controller._layout_applied_time = \
+                    time.monotonic()
             self._snapshot_vte_sizes()
         else:
             # Initial startup: no notify_resize has run yet.
@@ -335,7 +372,36 @@ class TmuxHandlers:
                     self._initial_capture_pending = False
                     self._send_initial_captures()
                 self._snapshot_vte_sizes()
-        self._schedule_reconcile(tree)
+        # Check for chrome change (e.g. tab bar appeared) before
+        # reconcile.  If chrome changed, update geometry hints first
+        # (so the WM snaps to the correct grid), then resize the
+        # window.  Skip reconcile — the resize will trigger fresh
+        # VTE allocations that produce correct sizes.
+        chrome_changed = False
+        for t in list(self.controller.terminal_to_pane.keys())[:1]:
+            try:
+                top = t.get_toplevel()
+                chrome = self._get_chrome_size(top)
+                if (self.controller._last_chrome is not None
+                        and chrome != self.controller._last_chrome):
+                    dbg('_finish_applying_layout: chrome_changed '
+                        '%dx%d -> %dx%d' % (
+                        self.controller._last_chrome[0],
+                        self.controller._last_chrome[1],
+                        chrome[0], chrome[1]))
+                    self.controller._last_chrome = chrome
+                    # Update hints before resize so WM uses new BASE
+                    top.set_tmux_geometry_hints(t)
+                    self._resize_window_to_tree(tree)
+                    self.controller._layout_applied_time = \
+                        time.monotonic()
+                    chrome_changed = True
+            except Exception:
+                pass
+            break
+
+        if not chrome_changed:
+            self._schedule_reconcile(tree)
         return False  # don't repeat
 
     def _snapshot_vte_sizes(self):
@@ -529,6 +595,7 @@ class TmuxHandlers:
                 if abs(paned.ratio - ratio) > 0.005:
                     paned.ratio = ratio
                     paned.set_position_by_ratio()
+                    self._ratios_changed = True
 
             # Move to the next intermediate paned
             remaining = remaining[1:]
