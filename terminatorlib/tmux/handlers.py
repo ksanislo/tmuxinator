@@ -598,14 +598,35 @@ class TmuxHandlers:
                 target_pos = 0
 
             # Detect if user is actively dragging THIS handle:
-            # position differs from last sync but length is same.
+            # mouse button held + position differs from last sync
+            # + length unchanged (not a parent reallocation).
             synced = getattr(paned, '_tmux_synced_pos', None)
             prev_len = getattr(paned, '_tmux_prev_len', None)
             cur_pos = paned.get_position()
-            user_dragging = (synced is not None
+            user_dragging = (getattr(paned,
+                                 '_tmux_handle_pressed', False)
+                             and synced is not None
                              and prev_len is not None
                              and cur_pos != synced
                              and paned_len == prev_len)
+
+            # Check if an ANCESTOR paned's handle is being
+            # dragged — this paned's total size is changing
+            # due to the parent drag, so let do_size_allocate
+            # anchor handle it instead of overriding here.
+            ancestor_dragging = False
+            w = paned.get_parent()
+            while w is not None:
+                if getattr(w, '_tmux_handle_pressed', False):
+                    ancestor_dragging = True
+                    break
+                w = w.get_parent()
+
+            skip_tag = ''
+            if user_dragging:
+                skip_tag = ' SKIP(user dragging)'
+            elif ancestor_dragging:
+                skip_tag = ' SKIP(ancestor drag)'
 
             dbg('ratio %s-split: left=%dpx right=%dpx '
                      'pos=%d old_pos=%d paned=%d '
@@ -615,14 +636,19 @@ class TmuxHandlers:
                          cur_pos, paned_len,
                          char_w, char_h, sb_w, tb_h,
                          handle_size, vpad_x, vpad_y,
-                         ' SKIP(user dragging)'
-                         if user_dragging else ''))
+                         skip_tag))
 
             if user_dragging:
                 # Don't fight the user's drag — leave their
                 # handle position alone.  Update synced_pos to
                 # the tmux target so _send_split_bar_resize
                 # knows the baseline for the next delta.
+                paned._tmux_synced_pos = target_pos
+            elif ancestor_dragging:
+                # An ancestor's handle is being dragged — this
+                # paned's total size is changing.  Let the
+                # do_size_allocate anchor keep child2 locked
+                # using pre-drag values.
                 paned._tmux_synced_pos = target_pos
             elif abs(cur_pos - target_pos) > 0:
                 paned.set_pos(target_pos)
@@ -637,11 +663,18 @@ class TmuxHandlers:
             # Record child2 target and current length so the
             # size-allocate handler can anchor child2 when a
             # parent drag changes this paned's total size.
-            paned._tmux_child2_px = right_px
-            paned._tmux_prev_len = paned_len
+            # Skip when an ancestor is being dragged — keep
+            # pre-drag anchor values so the far divider stays.
+            if not ancestor_dragging or user_dragging:
+                paned._tmux_child2_px = right_px
+                paned._tmux_prev_len = paned_len
             if not getattr(paned, '_tmux_anchor_connected', False):
                 paned.connect('size-allocate',
                               self._on_tmux_paned_allocate)
+                paned.connect('button-press-event',
+                              self._on_paned_button_press)
+                paned.connect('button-release-event',
+                              self._on_paned_button_release)
                 paned._tmux_anchor_connected = True
 
             # Store child1's pane_id (the terminal nearest the
@@ -733,14 +766,14 @@ class TmuxHandlers:
             return 0, 0, 0, 0, 0, 0
 
     def _on_tmux_paned_allocate(self, paned, allocation):
-        """Anchor child2 when a tmux layout change reallocates this paned.
+        """Anchor child2 when this paned is reallocated by a parent.
 
-        Only active during _applying_layout (tmux-driven updates).
-        During user drags, GTK's proportional redistribution is correct;
-        anchoring here would cause false VTE size changes that trigger
-        incorrect resize-pane commands targeting the wrong neighbor.
+        Skipped when the user is dragging THIS paned's handle
+        (they control the position). Active for all other cases:
+        tmux layout changes AND parent handle drags — this keeps
+        the far child locked so non-dragged dividers don't jitter.
         """
-        if not self.controller._applying_layout:
+        if getattr(paned, '_tmux_handle_pressed', False):
             return
         child2_px = getattr(paned, '_tmux_child2_px', None)
         if child2_px is None:
@@ -754,6 +787,26 @@ class TmuxHandlers:
         new_pos = max(cur_len - child2_px - handle, 0)
         if new_pos != paned.get_position():
             paned.set_pos(new_pos)
+
+    def _on_paned_button_press(self, paned, event):
+        """Track when user starts dragging a paned handle.
+
+        GTK propagates button-press from child paneds up to parents.
+        Only set the flag if the click actually landed on THIS
+        paned's handle — not on a descendant widget.
+        """
+        if event.button == 1:
+            from gi.repository import Gtk
+            target = Gtk.get_event_widget(event)
+            if target is paned:
+                paned._tmux_handle_pressed = True
+        return False  # let GTK handle the drag
+
+    def _on_paned_button_release(self, paned, event):
+        """Track when user stops dragging a paned handle."""
+        if event.button == 1:
+            paned._tmux_handle_pressed = False
+        return False
 
     def _get_handle_size(self, terminal):
         """Get Paned handle size by walking up from a terminal."""
