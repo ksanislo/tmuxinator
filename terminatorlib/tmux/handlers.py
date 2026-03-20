@@ -3,7 +3,7 @@
 All GTK operations are dispatched via GLib.idle_add() for thread safety.
 """
 
-from gi.repository import GLib
+from gi.repository import GLib, Gtk, Gdk
 
 from terminatorlib.util import dbg
 from terminatorlib.tmux.layout import (
@@ -563,6 +563,7 @@ class TmuxHandlers:
             char_sep = char_w if orient == 'h' else char_h
             paned._tmux_managed = True
             paned._tmux_handle_size = char_sep
+            self._apply_separator_css(paned, char_w, char_h)
 
             handle_size = paned.get_handlesize()
             paned_len = paned.get_length()
@@ -689,6 +690,32 @@ class TmuxHandlers:
             return char_w, char_h, sb_w, tb_h, vte_pad_x, vte_pad_y
         except Exception:
             return 0, 0, 0, 0, 0, 0
+
+    _tmux_sep_provider = None
+    _tmux_sep_css_key = None
+
+    def _apply_separator_css(self, paned, char_w, char_h):
+        """Style tmux-managed paned separators to fill one char cell."""
+        key = (char_w, char_h)
+        paned.get_style_context().add_class('tmux-sep')
+        if TmuxHandlers._tmux_sep_css_key == key:
+            return
+        css = (
+            'paned.tmux-sep > separator {'
+            ' min-width: %dpx; min-height: %dpx;'
+            ' }' % (char_w, char_h)
+        )
+        provider = Gtk.CssProvider()
+        provider.load_from_data(css.encode('utf-8'))
+        screen = Gdk.Screen.get_default()
+        old = TmuxHandlers._tmux_sep_provider
+        if old:
+            Gtk.StyleContext.remove_provider_for_screen(screen, old)
+        Gtk.StyleContext.add_provider_for_screen(
+            screen, provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 50)
+        TmuxHandlers._tmux_sep_provider = provider
+        TmuxHandlers._tmux_sep_css_key = key
 
     def _get_handle_size(self, terminal):
         """Get Paned handle size by walking up from a terminal."""
