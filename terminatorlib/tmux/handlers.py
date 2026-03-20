@@ -3,7 +3,7 @@
 All GTK operations are dispatched via GLib.idle_add() for thread safety.
 """
 
-from gi.repository import GLib, Gtk, Gdk
+from gi.repository import GLib
 
 from terminatorlib.util import dbg
 from terminatorlib.tmux.layout import (
@@ -27,6 +27,7 @@ class TmuxHandlers:
         self._needs_ratio_retry = False
         self._reconcile_timer = None
         self._initial_capture_pending = False
+        self._tmux_paneds = set()  # all tmux-managed paned widgets
         # Register handlers
         self.protocol.add_handler('output', self.on_output)
         self.protocol.add_handler('layout-change', self.on_layout_change)
@@ -558,12 +559,11 @@ class TmuxHandlers:
             if char_w <= 0 or char_h <= 0:
                 break
 
-            # Set tmux handle size override early so all math
-            # (including get_handlesize()) uses char_w/char_h.
+            # Mark as tmux-managed (disables snap fighting) but
+            # do NOT override handle size — let GTK report the real
+            # value so the padding logic below can compensate.
             char_sep = char_w if orient == 'h' else char_h
             paned._tmux_managed = True
-            paned._tmux_handle_size = char_sep
-            self._apply_separator_css(paned, char_w, char_h)
 
             handle_size = paned.get_handlesize()
             paned_len = paned.get_length()
@@ -588,26 +588,67 @@ class TmuxHandlers:
                 sep = char_w if orient == 'h' else char_h
                 right_px += (len(remaining) - 2) * sep
 
-            # Pad the first child so the visual gap
-            # (padding + handle) = 1 character cell.
-            if char_sep > handle_size:
-                left_px += char_sep - handle_size
+            # Anchor child2 at its exact target pixel size so that
+            # only child1 (the pane bordering the handle) absorbs
+            # size changes — the far pane stays fixed.  The gap
+            # between the real handle and a full character cell
+            # naturally becomes dead space in child1.
+            target_pos = paned_len - right_px - handle_size
+            if target_pos < 0:
+                target_pos = 0
 
-            total_px = left_px + right_px
-            if total_px > 0:
-                ratio = left_px / total_px
-                dbg('ratio %s-split: left=%dpx right=%dpx '
-                         'ratio=%.4f old=%.4f paned=%d '
-                         'char=%dx%d sb=%d tb=%d handle=%d '
-                         'vte_pad=%dx%d' % (
-                             orient, left_px, right_px, ratio,
-                             paned.ratio, paned_len,
-                             char_w, char_h, sb_w, tb_h,
-                             handle_size, vpad_x, vpad_y))
-                if abs(paned.ratio - ratio) > 0.005:
-                    paned.ratio = ratio
-                    paned.set_position_by_ratio()
-                    self._ratios_changed = True
+            # Detect if user is actively dragging THIS handle:
+            # position differs from last sync but length is same.
+            synced = getattr(paned, '_tmux_synced_pos', None)
+            prev_len = getattr(paned, '_tmux_prev_len', None)
+            cur_pos = paned.get_position()
+            user_dragging = (synced is not None
+                             and prev_len is not None
+                             and cur_pos != synced
+                             and paned_len == prev_len)
+
+            dbg('ratio %s-split: left=%dpx right=%dpx '
+                     'pos=%d old_pos=%d paned=%d '
+                     'char=%dx%d sb=%d tb=%d handle=%d '
+                     'vte_pad=%dx%d%s' % (
+                         orient, left_px, right_px, target_pos,
+                         cur_pos, paned_len,
+                         char_w, char_h, sb_w, tb_h,
+                         handle_size, vpad_x, vpad_y,
+                         ' SKIP(user dragging)'
+                         if user_dragging else ''))
+
+            if user_dragging:
+                # Don't fight the user's drag — leave their
+                # handle position alone.  Update synced_pos to
+                # the tmux target so _send_split_bar_resize
+                # knows the baseline for the next delta.
+                paned._tmux_synced_pos = target_pos
+            elif abs(cur_pos - target_pos) > 0:
+                paned.set_pos(target_pos)
+                # Update stored ratio to match the new position
+                paned.ratio = paned.ratio_by_position(
+                    paned_len, handle_size, target_pos)
+                self._ratios_changed = True
+                paned._tmux_synced_pos = paned.get_position()
+            else:
+                paned._tmux_synced_pos = cur_pos
+
+            # Record child2 target and current length so the
+            # size-allocate handler can anchor child2 when a
+            # parent drag changes this paned's total size.
+            paned._tmux_child2_px = right_px
+            paned._tmux_prev_len = paned_len
+            if not getattr(paned, '_tmux_anchor_connected', False):
+                paned.connect('size-allocate',
+                              self._on_tmux_paned_allocate)
+                paned._tmux_anchor_connected = True
+
+            # Store child1's pane_id (the terminal nearest the
+            # handle on the child1 side).
+            last_leaf_l = self._last_leaf(remaining[0])
+            paned._tmux_child1_pane_id = last_leaf_l.pane_id
+            self._tmux_paneds.add(paned)
 
             # Move to the next intermediate paned
             remaining = remaining[1:]
@@ -691,31 +732,28 @@ class TmuxHandlers:
         except Exception:
             return 0, 0, 0, 0, 0, 0
 
-    _tmux_sep_provider = None
-    _tmux_sep_css_key = None
+    def _on_tmux_paned_allocate(self, paned, allocation):
+        """Anchor child2 when a tmux layout change reallocates this paned.
 
-    def _apply_separator_css(self, paned, char_w, char_h):
-        """Style tmux-managed paned separators to fill one char cell."""
-        key = (char_w, char_h)
-        paned.get_style_context().add_class('tmux-sep')
-        if TmuxHandlers._tmux_sep_css_key == key:
+        Only active during _applying_layout (tmux-driven updates).
+        During user drags, GTK's proportional redistribution is correct;
+        anchoring here would cause false VTE size changes that trigger
+        incorrect resize-pane commands targeting the wrong neighbor.
+        """
+        if not self.controller._applying_layout:
             return
-        css = (
-            'paned.tmux-sep > separator {'
-            ' min-width: %dpx; min-height: %dpx;'
-            ' }' % (char_w, char_h)
-        )
-        provider = Gtk.CssProvider()
-        provider.load_from_data(css.encode('utf-8'))
-        screen = Gdk.Screen.get_default()
-        old = TmuxHandlers._tmux_sep_provider
-        if old:
-            Gtk.StyleContext.remove_provider_for_screen(screen, old)
-        Gtk.StyleContext.add_provider_for_screen(
-            screen, provider,
-            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 50)
-        TmuxHandlers._tmux_sep_provider = provider
-        TmuxHandlers._tmux_sep_css_key = key
+        child2_px = getattr(paned, '_tmux_child2_px', None)
+        if child2_px is None:
+            return
+        cur_len = paned.get_length()
+        prev_len = getattr(paned, '_tmux_prev_len', 0)
+        if cur_len == prev_len:
+            return  # length unchanged — no reallocation needed
+        paned._tmux_prev_len = cur_len
+        handle = paned.get_handlesize()
+        new_pos = max(cur_len - child2_px - handle, 0)
+        if new_pos != paned.get_position():
+            paned.set_pos(new_pos)
 
     def _get_handle_size(self, terminal):
         """Get Paned handle size by walking up from a terminal."""
@@ -914,6 +952,12 @@ class TmuxHandlers:
         if node.is_leaf:
             return node
         return self._first_leaf(node.children[0])
+
+    def _last_leaf(self, node):
+        """Find the last leaf node in a layout tree."""
+        if node.is_leaf:
+            return node
+        return self._last_leaf(node.children[-1])
 
     def _build_split_tree(self, node, terminal, maker):
         """Recursively split terminals to match the tmux layout tree.

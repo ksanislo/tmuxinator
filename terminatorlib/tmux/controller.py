@@ -644,70 +644,94 @@ class TmuxController:
         self._tripwire_timer = GLib.timeout_add(2000, _arm)
 
     def _send_split_bar_resize(self):
-        """Send absolute resize-pane for the pane with the largest size change.
+        """Send resize-pane for child1 of the dragged handle.
 
-        Uses absolute -x/-y for a single pane — tmux adjusts neighbors
-        automatically. This avoids needing to figure out which direction
-        the divider moved (which would require layout tree position info).
+        Identifies which paned handle the user dragged by finding the
+        paned whose position changed but length stayed the same.
+        Then targets child1 of that paned — this ensures tmux adjusts
+        the correct border (between child1 and its next sibling)
+        rather than taking space from a distant pane.
         """
-        best_pane = None
-        best_delta = 0
-        best_cols = 0
-        best_rows = 0
-        best_dcols = 0
-        best_drows = 0
-
-        for terminal, pane_id in self.terminal_to_pane.items():
-            try:
-                cur_cols = terminal.vte.get_column_count()
-                cur_rows = terminal.vte.get_row_count()
-            except Exception:
-                continue
-
-            prev = self._prev_vte_sizes.get(pane_id)
-            if prev is None:
-                continue
-
-            prev_cols, prev_rows = prev
-            dcols = abs(cur_cols - prev_cols)
-            drows = abs(cur_rows - prev_rows)
-            delta = dcols + drows
-
-            if delta > best_delta:
-                best_delta = delta
-                best_pane = pane_id
-                best_cols = cur_cols
-                best_rows = cur_rows
-                best_dcols = dcols
-                best_drows = drows
-
         # Log all pane deltas for debugging
         for terminal, pane_id in self.terminal_to_pane.items():
             try:
-                cur = (terminal.vte.get_column_count(), terminal.vte.get_row_count())
+                cur = (terminal.vte.get_column_count(),
+                       terminal.vte.get_row_count())
                 prev = self._prev_vte_sizes.get(pane_id)
                 if prev and cur != prev:
-                    dbg('split drag delta: %s prev=%dx%d cur=%dx%d' % (
-                        pane_id, prev[0], prev[1], cur[0], cur[1]))
+                    dbg('split drag delta: %s prev=%dx%d '
+                        'cur=%dx%d' % (
+                        pane_id, prev[0], prev[1],
+                        cur[0], cur[1]))
             except Exception:
                 pass
 
-        if best_pane and best_delta > 0:
-            import time as _time
-            # Only send the dimension(s) that actually changed
-            parts = ['resize-pane -t {}'.format(best_pane)]
-            if best_dcols > 0:
-                parts.append('-x {}'.format(best_cols))
-            if best_drows > 0:
-                parts.append('-y {}'.format(best_rows))
-            cmd = ' '.join(parts)
-            dbg('split drag: %s' % cmd)
-            self.protocol.send_command(cmd)
-            # Suppress echo-back from the layout-change response
-            self._layout_applied_time = _time.monotonic()
-            self._refresh_layout_state()
-        else:
-            dbg('split drag: no pane changed (best_delta=0)')
+        # Find the dragged handle: position changed, length same
+        paneds = getattr(self.handlers, '_tmux_paneds', set())
+        dragged = None
+        for paned in paneds:
+            synced = getattr(paned, '_tmux_synced_pos', None)
+            if synced is None:
+                continue
+            cur_pos = paned.get_position()
+            cur_len = paned.get_length()
+            prev_len = getattr(paned, '_tmux_prev_len', cur_len)
+            child1_id = getattr(
+                paned, '_tmux_child1_pane_id', '?')
+            dbg('split drag check: child1=%s pos=%d '
+                'synced=%d len=%d prev_len=%d' % (
+                child1_id, cur_pos, synced,
+                cur_len, prev_len))
+            if cur_pos != synced and cur_len == prev_len:
+                dragged = paned
+                break
+
+        if dragged is None:
+            dbg('split drag: no dragged handle found')
+            return
+
+        child1_id = getattr(dragged, '_tmux_child1_pane_id',
+                            None)
+        if child1_id is None:
+            dbg('split drag: no child1 pane_id')
+            return
+
+        terminal = self.pane_to_terminal.get(child1_id)
+        if terminal is None:
+            dbg('split drag: terminal not found for %s'
+                % child1_id)
+            return
+
+        try:
+            cur_cols = terminal.vte.get_column_count()
+            cur_rows = terminal.vte.get_row_count()
+        except Exception:
+            return
+
+        prev = self._prev_vte_sizes.get(child1_id)
+        if prev is None:
+            return
+
+        prev_cols, prev_rows = prev
+        dcols = abs(cur_cols - prev_cols)
+        drows = abs(cur_rows - prev_rows)
+
+        if dcols == 0 and drows == 0:
+            dbg('split drag: child1 %s unchanged (%dx%d)'
+                % (child1_id, cur_cols, cur_rows))
+            return
+
+        import time as _time
+        parts = ['resize-pane -t {}'.format(child1_id)]
+        if dcols > 0:
+            parts.append('-x {}'.format(cur_cols))
+        if drows > 0:
+            parts.append('-y {}'.format(cur_rows))
+        cmd = ' '.join(parts)
+        dbg('split drag: %s (child1 of dragged handle)' % cmd)
+        self.protocol.send_command(cmd)
+        self._layout_applied_time = _time.monotonic()
+        self._refresh_layout_state()
 
     def _refresh_layout_state(self):
         """Send list-windows to refresh our layout tree after a resize."""
