@@ -78,6 +78,15 @@ class TmuxHandlers:
                     return window
         return None
 
+    def _is_active_window(self, tree):
+        """Check if this layout tree's panes are in the currently visible tab."""
+        pane_ids = get_pane_ids(tree)
+        for pid in pane_ids:
+            terminal = self.controller.pane_to_terminal.get(pid)
+            if terminal and terminal.get_mapped():
+                return True
+        return False
+
     def on_layout_change(self, info):
         """Handle %layout-change: sync Terminator splits with tmux layout."""
         import time, traceback
@@ -135,9 +144,15 @@ class TmuxHandlers:
         elif added_panes:
             GLib.idle_add(self._add_panes, added_panes, new_tree)
         else:
-            # If the layout dimensions changed and we didn't cause it
-            # (unsolicited = another client resized), resize our window
-            # to match — tmux is the authority for external changes.
+            # Only process resize/constraint logic for the active
+            # window (panes currently visible). Background windows
+            # (e.g. @30 at 132x40) must not resize us or set MAX.
+            active = self._is_active_window(new_tree)
+            if not active:
+                dbg('layout-change: skipping resize for background '
+                    'window %s' % window_id)
+                return
+
             new_size = (new_tree.width, new_tree.height)
             we_caused_it = elapsed < 1.0
             if client_size and new_size != client_size and not we_caused_it:
@@ -145,11 +160,9 @@ class TmuxHandlers:
                          '%dx%d -> %dx%d (elapsed=%.3fs), resizing window' % (
                              client_size[0], client_size[1],
                              new_size[0], new_size[1], elapsed))
-                # Reset max so _update_max_from_tree can lower it
                 self.controller._tmux_max_chars = None
                 GLib.idle_add(self._resize_window_to_tree, new_tree)
             elif client_size and new_size != client_size:
-                # Tmux gave us a different size than we asked for
                 rejected = (new_size[0] < client_size[0] or
                             new_size[1] < client_size[1])
                 if rejected:
@@ -157,13 +170,20 @@ class TmuxHandlers:
                              '(elapsed=%.3fs), re-constraining' % (
                                  client_size[0], client_size[1],
                                  new_size[0], new_size[1], elapsed))
-                    self.controller._tmux_max_chars = None
-                    GLib.idle_add(self._resize_window_to_tree, new_tree)
+                    # Don't clear _tmux_max_chars or call _resize_window_to_tree
+                    # here — _update_max_from_tree will set the hard MAX hint
+                    # and the WM enforces the constraint. Snapping back during
+                    # drag fights the mouse and causes jitter.
                 else:
                     dbg('layout-change: echo-back size change '
                              '%dx%d -> %dx%d (elapsed=%.3fs)' % (
                                  client_size[0], client_size[1],
                                  new_size[0], new_size[1], elapsed))
+            else:
+                # Confirmed match or initial state — snap window
+                # to match tmux's layout (catches chrome changes
+                # like tab bar appearing).
+                GLib.idle_add(self._resize_window_to_tree, new_tree)
 
             # Update max size from tree dimensions (free, no query)
             GLib.idle_add(self._update_max_from_tree,
@@ -1077,8 +1097,9 @@ class TmuxHandlers:
                     self.controller._tmux_max_chars = (cols, rows)
                     self._set_max_size_pixels(info[0], info[1])
                 self.controller._arm_tripwire_after_idle()
-            elif not self.controller._tripwire_armed:
-                # Echo-back — arm tripwire instantly
+            elif not self.controller._tripwire_armed \
+                    and not self.controller._tripwire_timer:
+                # Echo-back with no pending delayed arm — arm instantly
                 self.controller._do_arm_tripwire()
         return False
 
