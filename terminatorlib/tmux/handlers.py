@@ -559,11 +559,16 @@ class TmuxHandlers:
             if char_w <= 0 or char_h <= 0:
                 break
 
-            # Mark as tmux-managed (disables snap fighting) but
-            # do NOT override handle size — let GTK report the real
-            # value so the padding logic below can compensate.
+            # Mark as tmux-managed (disables snap fighting).
+            # Set handle size to match tmux's 1-character separator.
+            # GTK still renders its real handle (e.g. 9px), but our
+            # position math uses char_sep so left_px + right_px +
+            # char_sep = _subtree_px total.  Without this, the 9px
+            # difference per nested separator compounds into dead
+            # space that inflates VTE character counts.
             char_sep = char_w if orient == 'h' else char_h
             paned._tmux_managed = True
+            paned._tmux_handle_size = char_sep
 
             handle_size = paned.get_handlesize()
             paned_len = paned.get_length()
@@ -889,11 +894,10 @@ class TmuxHandlers:
             new_terminal._make_titlebar_overlay()
             self.controller.register_terminal(pane_id, new_terminal)
 
-            # Capture initial content
-            self.protocol.send_command(
-                'capture-pane -J -p -t {} -e -S - -E -'.format(pane_id),
-                callback=lambda result, t=new_terminal: self._feed_captured(t, result),
-            )
+            # Don't capture-pane here — the shell prompt and any
+            # output that arrived before registration are already
+            # buffered in _pending_output and replayed by
+            # register_terminal.  Capturing would duplicate them.
 
             # Split the existing terminal
             old_parent = old_terminal.get_parent()
