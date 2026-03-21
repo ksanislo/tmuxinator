@@ -613,13 +613,22 @@ class TmuxController:
         cascade from this configure-event will trigger VTE
         size-allocate → notify_resize → idle schedule.
         """
+        ws = window.get_size()
+        wa = window.get_allocation()
         if self._window_resize_pending:
             self._window_resize_pending = False
-            self._last_window_pixels = window.get_size()
+            self._last_window_pixels = ws
             dbg('configure-event: resize complete, '
-                'size=%s applying=%s' % (
-                self._last_window_pixels,
+                'size=%s alloc=%dx%d applying=%s' % (
+                ws, wa.width, wa.height,
                 self._applying_layout))
+        else:
+            dbg('configure-event: unsolicited, '
+                'size=%s alloc=%dx%d applying=%s '
+                'last_px=%s' % (
+                ws, wa.width, wa.height,
+                self._applying_layout,
+                self._last_window_pixels))
         return False  # propagate
 
     def _do_arm_tripwire(self):

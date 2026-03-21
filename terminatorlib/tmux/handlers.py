@@ -351,12 +351,99 @@ class TmuxHandlers:
         # paned allocations.  The first _apply_ratios (from
         # _update_pane_sizes) used pre-resize dimensions; now that
         # the WM resize has landed, recomputing gives exact positions.
+
+        # --- diagnostic: log window and VTE state before _apply_ratios ---
+        for t in list(self.controller.terminal_to_pane.keys()):
+            try:
+                pid = self.controller.terminal_to_pane[t]
+                top = t.get_toplevel()
+                ws = top.get_size()
+                vte = t.vte
+                vte_pref_h = vte.get_preferred_height()
+                cols = vte.get_column_count()
+                rows = vte.get_row_count()
+                va = vte.get_allocation()
+                char_h = vte.get_char_height()
+                # Terminal (VBox) preferred height
+                term_pref_h = t.get_preferred_height()
+                ta = t.get_allocation()
+                dbg('_finish PRE: %s ws=%dx%d '
+                    'vte_alloc=%dx%d vte_chars=%dx%d '
+                    'vte_pref_h=%s term_pref_h=%s '
+                    'term_alloc_h=%d char_h=%d' % (
+                    pid, ws[0], ws[1],
+                    va.width, va.height, cols, rows,
+                    vte_pref_h, term_pref_h,
+                    ta.height, char_h))
+            except Exception as e:
+                dbg('_finish PRE: %s exception: %s' % (
+                    self.controller.terminal_to_pane.get(t, '?'), e))
+        # Also log root paned preferred height
+        for t in list(self.controller.terminal_to_pane.keys())[:1]:
+            try:
+                rp = self._find_root_paned(t)
+                if rp:
+                    rp_pref_h = rp.get_preferred_height()
+                    rp_alloc = rp.get_allocation()
+                    dbg('_finish PRE: root_paned '
+                        'pref_h=%s alloc=%dx%d' % (
+                        rp_pref_h,
+                        rp_alloc.width, rp_alloc.height))
+            except Exception:
+                pass
+
         if tree and not tree.is_leaf:
             self._apply_ratios(tree)
+
+        # --- diagnostic: log window and VTE state after _apply_ratios ---
+        for t in list(self.controller.terminal_to_pane.keys()):
+            try:
+                pid = self.controller.terminal_to_pane[t]
+                top = t.get_toplevel()
+                ws = top.get_size()
+                vte = t.vte
+                vte_pref_h = vte.get_preferred_height()
+                va = vte.get_allocation()
+                term_pref_h = t.get_preferred_height()
+                ta = t.get_allocation()
+                dbg('_finish POST: %s ws=%dx%d '
+                    'vte_alloc=%dx%d '
+                    'vte_pref_h=%s term_pref_h=%s '
+                    'term_alloc_h=%d' % (
+                    pid, ws[0], ws[1],
+                    va.width, va.height,
+                    vte_pref_h, term_pref_h,
+                    ta.height))
+            except Exception:
+                pass
+        # Also log root paned preferred height after
+        for t in list(self.controller.terminal_to_pane.keys())[:1]:
+            try:
+                rp = self._find_root_paned(t)
+                if rp:
+                    rp_pref_h = rp.get_preferred_height()
+                    rp_alloc = rp.get_allocation()
+                    dbg('_finish POST: root_paned '
+                        'pref_h=%s alloc=%dx%d' % (
+                        rp_pref_h,
+                        rp_alloc.width, rp_alloc.height))
+            except Exception:
+                pass
 
         dbg('_finish_applying_layout: clearing _applying_layout')
         self.controller._applying_layout = False
         self.controller._refresh_client_in_flight = False
+        # Snapshot actual window size so notify_resize detects any
+        # WM bounce (the WM may have given us a different size than
+        # we requested, and the configure-event handler may have
+        # stamped _last_window_pixels with a stale value).
+        for t in list(self.controller.terminal_to_pane.keys())[:1]:
+            try:
+                top = t.get_toplevel()
+                self.controller._last_window_pixels = top.get_size()
+                break
+            except Exception:
+                pass
         self.controller._process_tripwire()
         self.controller._layout_applied_time = time.monotonic()
         initial = self.controller._last_client_size is None
