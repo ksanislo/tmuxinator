@@ -492,6 +492,20 @@ class TmuxHandlers:
                 # report; this provides the matching "second" report
                 # so panes become settled when sizes haven't changed.
                 if self._initial_capture_pending:
+                    # Pre-seed panes that didn't fire notify_resize
+                    # (VTE was already at correct size — no
+                    # size-allocate, so no suppressed resize).
+                    for t, pid in (self.controller
+                                   .terminal_to_pane.items()):
+                        if pid not in self._capture_sizes:
+                            try:
+                                self._capture_sizes[pid] = (
+                                    t.vte.get_column_count(),
+                                    t.vte.get_row_count())
+                            except Exception:
+                                pass
+                    # Now feed current VTE sizes as the "second"
+                    # report — matches stored sizes → settled.
                     for t, pid in (self.controller
                                    .terminal_to_pane.items()):
                         try:
