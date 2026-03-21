@@ -27,6 +27,8 @@ class TmuxHandlers:
         self._needs_ratio_retry = False
         self._reconcile_timer = None
         self._initial_capture_pending = False
+        self._capture_sizes = {}    # pane_id → (cols, rows)
+        self._capture_settled = set()  # panes that reported unchanged
         self._tmux_paneds = set()  # all tmux-managed paned widgets
         self._layout_change_pending = False
         # Register handlers
@@ -484,10 +486,20 @@ class TmuxHandlers:
                 dbg('_finish_applying_layout: initial '
                     'client size %d,%d (from tree)' % (cols, rows))
                 self.controller._refresh_layout_state()
-                if self._initial_capture_pending:
-                    self._initial_capture_pending = False
-                    self._send_initial_captures()
                 self._snapshot_vte_sizes()
+                # Feed current VTE sizes into stability tracker.
+                # Suppressed notify_resize calls stored the "first"
+                # report; this provides the matching "second" report
+                # so panes become settled when sizes haven't changed.
+                if self._initial_capture_pending:
+                    for t, pid in (self.controller
+                                   .terminal_to_pane.items()):
+                        try:
+                            c = t.vte.get_column_count()
+                            r = t.vte.get_row_count()
+                            self._check_pane_stable(pid, c, r)
+                        except Exception:
+                            pass
         # Check for chrome change (e.g. tab bar appeared) before
         # reconcile.  If chrome changed, update geometry hints first
         # (so the WM snaps to the correct grid), then resize the
@@ -1407,6 +1419,46 @@ class TmuxHandlers:
             raw = b'\r\n'.join(line for line in result.output_lines if line)
             data = unescape_tmux_output(raw)
             GLib.idle_add(self._feed_terminal, terminal, data)
+
+    def _check_pane_stable(self, pane_id, cols, rows):
+        """Track per-pane size stability; fire capture when all settled.
+
+        Called from notify_resize.  A pane is 'settled' when it reports
+        the same size as its previous report.  When ALL registered panes
+        are settled simultaneously, VTEs have converged and we fire the
+        initial capture.
+        """
+        cur = (cols, rows)
+        prev = self._capture_sizes.get(pane_id)
+        if prev == cur:
+            self._capture_settled.add(pane_id)
+        else:
+            self._capture_sizes[pane_id] = cur
+            self._capture_settled.discard(pane_id)
+
+        all_panes = set(self.controller.terminal_to_pane.values())
+        if all_panes and all_panes <= self._capture_settled:
+            dbg('initial capture: all %d panes settled'
+                % len(all_panes))
+            self._initial_capture_pending = False
+            self._capture_sizes.clear()
+            self._capture_settled.clear()
+            self._do_initial_capture()
+
+    def _do_initial_capture(self):
+        """VTEs converged — send refresh-client and capture all panes."""
+        total_cols, total_rows = \
+            self.controller._calculate_client_size()
+        if total_cols > 0 and total_rows > 0:
+            size = (total_cols, total_rows)
+            self.controller._last_client_size = size
+            dbg('do_initial_capture: refresh-client -C %d,%d'
+                % (total_cols, total_rows))
+            self.controller.protocol.send_command(
+                'refresh-client -C {},{}'.format(
+                    total_cols, total_rows))
+        self._send_initial_captures()
+        self._snapshot_vte_sizes()
 
     def _chars_to_max_pixels(self, cols, rows):
         """Convert character dimensions to max pixel size for geometry hints.

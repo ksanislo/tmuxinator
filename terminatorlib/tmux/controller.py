@@ -419,6 +419,10 @@ class TmuxController:
                 self._layout_clear_source = GLib.idle_add(
                     self._do_finish_applying_layout, tree,
                     priority=GLib.PRIORITY_DEFAULT_IDLE + 10)
+            if (self.handlers and
+                    self.handlers._initial_capture_pending):
+                self.handlers._check_pane_stable(
+                    pane_id, cols, rows)
             return
 
         def do_resize():
@@ -571,10 +575,6 @@ class TmuxController:
                                     total_cols, total_rows))
                             self._refresh_layout_state(
                                 callback=self._on_refresh_complete)
-                            if (self.handlers and
-                                    self.handlers._initial_capture_pending):
-                                self.handlers._initial_capture_pending = False
-                                self.handlers._send_initial_captures()
                 else:
                     dbg('notify_resize: skipped (refresh in flight)')
             else:
@@ -585,6 +585,9 @@ class TmuxController:
             return False
 
         do_resize()
+
+        if self.handlers and self.handlers._initial_capture_pending:
+            self.handlers._check_pane_stable(pane_id, cols, rows)
 
     def _do_finish_applying_layout(self, tree):
         """Clear _applying_layout after all VTE size-allocate callbacks.
