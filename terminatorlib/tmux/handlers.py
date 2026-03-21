@@ -347,19 +347,12 @@ class TmuxHandlers:
         """
         import time
 
-        # Re-apply positions that GTK proportionally scaled during
-        # the first allocation.  After that allocation, each paned's
-        # last_allocation matches its current size, so set_pos() now
-        # sticks without being rescaled.
-        for paned in getattr(self, '_tmux_paneds', set()):
-            tmux_pos = getattr(paned, '_tmux_synced_pos', None)
-            if tmux_pos is not None:
-                cur_pos = paned.get_position()
-                if cur_pos != tmux_pos:
-                    paned.set_pos(tmux_pos)
-                # Update prev_len to actual allocation now that
-                # positions have settled.
-                paned._tmux_prev_len = paned.get_length()
+        # Recompute positions from the tree using actual post-resize
+        # paned allocations.  The first _apply_ratios (from
+        # _update_pane_sizes) used pre-resize dimensions; now that
+        # the WM resize has landed, recomputing gives exact positions.
+        if tree and not tree.is_leaf:
+            self._apply_ratios(tree)
 
         dbg('_finish_applying_layout: clearing _applying_layout')
         self.controller._applying_layout = False
