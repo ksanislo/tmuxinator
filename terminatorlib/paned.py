@@ -564,33 +564,6 @@ class HPaned(Paned, Gtk.HPaned):
             GLib.idle_add(_measure)
 
     def do_size_allocate(self, allocation):
-        """Anchor child2 before GTK lays out children.
-
-        Without this, GTK keeps child1 at the stored position and
-        child2 absorbs the size change — causing one-frame jitter
-        on the far divider.  By adjusting position here, the parent
-        class method sees the correct value immediately.
-        """
-        child2_px = getattr(self, '_tmux_child2_px', None)
-        if (child2_px is not None
-                and not getattr(self,
-                                '_tmux_handle_pressed', False)):
-            new_len = allocation.width
-            prev_len = getattr(self, '_tmux_prev_len', 0)
-            if new_len != prev_len:
-                self._tmux_prev_len = new_len
-                handle = self.get_handlesize()
-                new_pos = max(new_len - child2_px - handle, 0)
-                old_pos = self.get_position()
-                dbg('HPaned anchor: alloc=%dx%d '
-                    'prev=%d new=%d child2=%d '
-                    'handle=%d pos %d->%d' % (
-                    allocation.width, allocation.height,
-                    prev_len, new_len, child2_px,
-                    handle, old_pos, new_pos))
-                if new_pos != old_pos:
-                    Gtk.HPaned.set_position(self, new_pos)
-                    self.set_property('position-set', True)
         Gtk.HPaned.do_size_allocate(self, allocation)
 
     def get_length(self):
@@ -650,31 +623,6 @@ class VPaned(Paned, Gtk.VPaned):
             GLib.idle_add(_measure)
 
     def do_size_allocate(self, allocation):
-        """Anchor child2 before GTK lays out children.
-
-        Same as HPaned — prevents one-frame jitter on the far
-        divider when a parent handle is dragged.
-        """
-        child2_px = getattr(self, '_tmux_child2_px', None)
-        if (child2_px is not None
-                and not getattr(self,
-                                '_tmux_handle_pressed', False)):
-            new_len = allocation.height
-            prev_len = getattr(self, '_tmux_prev_len', 0)
-            if new_len != prev_len:
-                self._tmux_prev_len = new_len
-                handle = self.get_handlesize()
-                new_pos = max(new_len - child2_px - handle, 0)
-                old_pos = self.get_position()
-                dbg('VPaned anchor: alloc=%dx%d '
-                    'prev=%d new=%d child2=%d '
-                    'handle=%d pos %d->%d' % (
-                    allocation.width, allocation.height,
-                    prev_len, new_len, child2_px,
-                    handle, old_pos, new_pos))
-                if new_pos != old_pos:
-                    Gtk.VPaned.set_position(self, new_pos)
-                    self.set_property('position-set', True)
         Gtk.VPaned.do_size_allocate(self, allocation)
 
     def get_length(self):
