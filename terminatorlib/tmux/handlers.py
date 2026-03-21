@@ -28,6 +28,7 @@ class TmuxHandlers:
         self._reconcile_timer = None
         self._initial_capture_pending = False
         self._tmux_paneds = set()  # all tmux-managed paned widgets
+        self._layout_change_pending = False
         # Register handlers
         self.protocol.add_handler('output', self.on_output)
         self.protocol.add_handler('layout-change', self.on_layout_change)
@@ -234,6 +235,7 @@ class TmuxHandlers:
                           new_tree.width, new_tree.height)
 
             # Same panes but resized — update our splits to match
+            self._layout_change_pending = True
             GLib.idle_add(self._update_pane_sizes, new_tree)
 
     def _log_layout_sizes(self, node, depth=0):
@@ -259,6 +261,7 @@ class TmuxHandlers:
     def _update_pane_sizes(self, tree):
         """Update split ratios to match tmux's pane dimensions.
         Called on GTK thread."""
+        self._layout_change_pending = False
         import time
         # Trace window size at pane-size update
         for t in list(self.controller.terminal_to_pane.keys())[:1]:
@@ -343,8 +346,25 @@ class TmuxHandlers:
         refresh-client with pre-ratio VTE column counts.
         """
         import time
+
+        # Re-apply positions that GTK proportionally scaled during
+        # the first allocation.  After that allocation, each paned's
+        # last_allocation matches its current size, so set_pos() now
+        # sticks without being rescaled.
+        for paned in getattr(self, '_tmux_paneds', set()):
+            tmux_pos = getattr(paned, '_tmux_synced_pos', None)
+            if tmux_pos is not None:
+                cur_pos = paned.get_position()
+                if cur_pos != tmux_pos:
+                    paned.set_pos(tmux_pos)
+                # Update prev_len to actual allocation now that
+                # positions have settled.
+                paned._tmux_prev_len = paned.get_length()
+
         dbg('_finish_applying_layout: clearing _applying_layout')
         self.controller._applying_layout = False
+        self.controller._refresh_client_in_flight = False
+        self.controller._process_tripwire()
         self.controller._layout_applied_time = time.monotonic()
         initial = self.controller._last_client_size is None
         if not initial:
@@ -557,6 +577,7 @@ class TmuxHandlers:
         #   etc.
         orient = node.orientation  # 'h' or 'v'
         remaining = node.children
+        expected_child2_len = None
 
         while len(remaining) >= 2:
             first_leaf_l = self._first_leaf(remaining[0])
@@ -583,22 +604,11 @@ class TmuxHandlers:
             # Mark as tmux-managed (disables snap fighting).
             paned._tmux_managed = True
 
-            # Tell GTK to keep child1 at its set position when
-            # the paned is resized — don't proportionally rescale.
-            # Without this, gtk_paned_calc_position does
-            # pos = new_alloc * old_pos / old_alloc, which negates
-            # any position we set in do_size_allocate.
-            child1 = paned.get_child1()
-            child2 = paned.get_child2()
-            if child1:
-                paned.child_set_property(
-                    child1, 'resize', False)
-            if child2:
-                paned.child_set_property(
-                    child2, 'resize', True)
-
             handle_size = paned.get_handlesize()
-            paned_len = paned.get_length()
+            if expected_child2_len is not None:
+                paned_len = expected_child2_len
+            else:
+                paned_len = paned.get_length()
 
             if paned_len <= handle_size:
                 dbg('ratio SKIPPED: paned not allocated '
@@ -747,9 +757,8 @@ class TmuxHandlers:
                 paned._tmux_synced_pos = target_pos
             elif ancestor_dragging:
                 # An ancestor's handle is being dragged — this
-                # paned's total size is changing.  Let the
-                # do_size_allocate anchor keep child2 locked
-                # using pre-drag values.
+                # paned's size is changing proportionally via GTK.
+                # Don't override with _apply_ratios position.
                 paned._tmux_synced_pos = target_pos
             elif abs(cur_pos - target_pos) > 0:
                 paned.set_pos(target_pos)
@@ -761,17 +770,11 @@ class TmuxHandlers:
             else:
                 paned._tmux_synced_pos = cur_pos
 
-            # Record child2 target and current length so the
-            # size-allocate handler can anchor child2 when a
-            # parent drag changes this paned's total size.
-            # Skip when an ancestor is being dragged — keep
-            # pre-drag anchor values so the far divider stays.
-            if not ancestor_dragging or user_dragging:
-                paned._tmux_child2_px = right_px
-                paned._tmux_prev_len = paned_len
+            paned._tmux_prev_len = paned_len
+            effective_pos = paned.get_position()
+            expected_child2_len = (paned_len - effective_pos
+                                   - handle_size)
             if not getattr(paned, '_tmux_anchor_connected', False):
-                paned.connect('size-allocate',
-                              self._on_tmux_paned_allocate)
                 paned.connect('button-press-event',
                               self._on_paned_button_press)
                 paned.connect('button-release-event',
@@ -865,29 +868,6 @@ class TmuxHandlers:
             return char_w, char_h, sb_w, tb_h, vte_pad_x, vte_pad_y
         except Exception:
             return 0, 0, 0, 0, 0, 0
-
-    def _on_tmux_paned_allocate(self, paned, allocation):
-        """Anchor child2 when this paned is reallocated by a parent.
-
-        Skipped when the user is dragging THIS paned's handle
-        (they control the position). Active for all other cases:
-        tmux layout changes AND parent handle drags — this keeps
-        the far child locked so non-dragged dividers don't jitter.
-        """
-        if getattr(paned, '_tmux_handle_pressed', False):
-            return
-        child2_px = getattr(paned, '_tmux_child2_px', None)
-        if child2_px is None:
-            return
-        cur_len = paned.get_length()
-        prev_len = getattr(paned, '_tmux_prev_len', 0)
-        if cur_len == prev_len:
-            return  # length unchanged — no reallocation needed
-        paned._tmux_prev_len = cur_len
-        handle = paned.get_handlesize()
-        new_pos = max(cur_len - child2_px - handle, 0)
-        if new_pos != paned.get_position():
-            paned.set_pos(new_pos)
 
     def _on_paned_button_press(self, paned, event):
         """Track when user starts dragging a paned handle.
