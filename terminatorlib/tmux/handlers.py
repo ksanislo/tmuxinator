@@ -783,25 +783,9 @@ class TmuxHandlers:
             # mouse button held + position differs from last sync
             # + length unchanged (not a parent reallocation).
             #
-            # GTK3 button-release may not fire reliably on paneds,
-            # so verify actual pointer state when flag is set.
             synced = getattr(paned, '_tmux_synced_pos', None)
             prev_len = getattr(paned, '_tmux_prev_len', None)
             cur_pos = paned.get_position()
-            if getattr(paned, '_tmux_handle_pressed', False):
-                try:
-                    from gi.repository import Gdk
-                    seat = paned.get_display().get_default_seat()
-                    ptr = seat.get_pointer()
-                    win = paned.get_window()
-                    if win and ptr:
-                        _, _, _, mask = \
-                            win.get_device_position(ptr)
-                        if not (mask
-                                & Gdk.ModifierType.BUTTON1_MASK):
-                            paned._tmux_handle_pressed = False
-                except Exception:
-                    pass
             user_dragging = (getattr(paned,
                                  '_tmux_handle_pressed', False)
                              and synced is not None
@@ -813,28 +797,11 @@ class TmuxHandlers:
             # dragged — this paned's total size is changing
             # due to the parent drag, so let do_size_allocate
             # anchor handle it instead of overriding here.
-            # Uses the same pointer-state verification as above.
+            # Relies on button-release clearing _tmux_handle_pressed.
             ancestor_dragging = False
             w = paned.get_parent()
             while w is not None:
                 if getattr(w, '_tmux_handle_pressed', False):
-                    # Verify button is actually held
-                    try:
-                        from gi.repository import Gdk
-                        seat = w.get_display().get_default_seat()
-                        ptr = seat.get_pointer()
-                        wn = w.get_window()
-                        if wn and ptr:
-                            _, _, _, mask = \
-                                wn.get_device_position(ptr)
-                            if not (mask
-                                    & Gdk.ModifierType
-                                    .BUTTON1_MASK):
-                                w._tmux_handle_pressed = False
-                                w = w.get_parent()
-                                continue
-                    except Exception:
-                        pass
                     ancestor_dragging = True
                     break
                 w = w.get_parent()
@@ -986,13 +953,20 @@ class TmuxHandlers:
             from gi.repository import Gtk
             target = Gtk.get_event_widget(event)
             if target is paned:
+                child1_id = getattr(paned,
+                    '_tmux_child1_pane_id', '?')
+                dbg('paned button-press: child1=%s' % child1_id)
                 paned._tmux_handle_pressed = True
         return False  # let GTK handle the drag
 
     def _on_paned_button_release(self, paned, event):
         """Track when user stops dragging a paned handle."""
         if event.button == 1:
+            child1_id = getattr(paned,
+                '_tmux_child1_pane_id', '?')
+            dbg('paned button-release: child1=%s' % child1_id)
             paned._tmux_handle_pressed = False
+            paned._tmux_synced_pos = paned.get_position()
         return False
 
     def _get_handle_size(self, terminal):
