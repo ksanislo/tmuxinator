@@ -216,6 +216,27 @@ class Terminator(Borg):
             ch = terminal.vte.get_char_height()
             if cw > 0 and ch > 0:
                 cols, rows = tmux_size
+                # Cap against workarea — only clamp dimensions
+                # that exceed the screen, leave others untouched.
+                display = window.get_display()
+                if display:
+                    monitor = (display.get_primary_monitor()
+                               or display.get_monitor(0))
+                    if monitor:
+                        work = monitor.get_workarea()
+                        max_cols = work.width // cw
+                        max_rows = work.height // ch
+                        if cols > max_cols:
+                            dbg('pre-size: capping cols %d -> %d '
+                                '(workarea %dpx)' % (
+                                cols, max_cols, work.width))
+                            cols = max_cols
+                        if rows > max_rows:
+                            dbg('pre-size: capping rows %d -> %d '
+                                '(workarea %dpx)' % (
+                                rows, max_rows, work.height))
+                            rows = max_rows
+                        tmux_size = (cols, rows)
                 w, h = cols * cw, rows * ch
                 window.set_default_size(w, h)
                 dbg('pre-size: tmux=%dx%d char=%dx%d '
@@ -230,6 +251,7 @@ class Terminator(Borg):
         terminal.spawn_child()
         terminal.emit('tab-change', 0)
 
+        window._tmux_capped_size = tmux_size
         return(window, terminal)
 
     def create_layout(self, layoutname):
@@ -388,6 +410,11 @@ class Terminator(Borg):
                 tmux_size = (int(size[0]), int(size[1]))
             window, terminal = self.new_window(
                 tmux_size=tmux_size)
+            # new_window may have capped tmux_size to fit the
+            # screen — use the capped value for post-layout resize
+            # and to inform tmux of the actual client size.
+            tmux_size = getattr(window, '_tmux_capped_size',
+                                tmux_size)
             window.create_layout(layout[windef])
             if tmux_size:
                 # Resize with real char metrics + chrome.

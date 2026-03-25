@@ -11,6 +11,7 @@ from gi.repository import Gdk, GLib
 from terminatorlib.util import dbg
 from terminatorlib.tmux.protocol import TmuxProtocol, TmuxProtocolFromPty
 from terminatorlib.tmux.layout import parse_tmux_layout, build_terminator_layout
+from terminatorlib.tmux.state import TmuxSyncState
 
 
 ESCAPE_CODE = '\033'
@@ -80,34 +81,19 @@ class TmuxController:
 
     def __init__(self):
         self.active = False
+        self.state = TmuxSyncState()
+        self.state.connect('layout-settled', self._on_layout_settled)
         self.pane_to_terminal = {}
         self.terminal_to_pane = {}
         self.pane_alternate = {}
         self.window_layouts = {}
         self.window_names = {}
         self.window_indices = {}
-        self._last_pane_sizes = {}
-        self._prev_vte_sizes = {}
-        self._applying_layout = False
-        self._layout_clear_scheduled = False
-        self._layout_applied_time = 0
         self._resize_timer = None
-        self._refresh_client_in_flight = False
-        self._pending_tripwire_hit = False
-        self._tmux_max_cols = None   # per-axis max from tmux rejection
-        self._tmux_max_rows = None
-        self._tripwire_timer = None
-        self._tripwire_armed = False
-        self._tripwire_pixels = None
         self._initial_layout_ready = threading.Event()
         self.session_name = None
         self.protocol = None
         self.handlers = None
-        self._last_client_size = None
-        self._last_window_pixels = None
-        self._window_resize_pending = False  # True after window.resize() until WM responds
-        self._configure_handler_id = None
-        self._last_chrome = None  # (w, h) content-term chrome
         self.active_window_id = None  # @id of tmux's active window
         self._pending_output = {}  # pane_id -> [data, ...] for pre-registration %output
         self._origin_terminal = None  # terminal that ran tmux -CC (PTY takeover)
@@ -180,7 +166,7 @@ class TmuxController:
             self.protocol._bridge.restore_termios()
         if self.protocol:
             self.protocol.stop(send_detach=send_detach)
-        self._refresh_client_in_flight = False
+        self.state.reset()
         self.active = False
         # Restore the original PTY on the terminal that ran tmux -CC
         if self._origin_terminal:
@@ -259,11 +245,6 @@ class TmuxController:
         self.pane_to_terminal[pane_id] = terminal
         self.terminal_to_pane[terminal] = pane_id
         terminal._tmux_controller = self
-        # Tmux controls content and sends fresh output on resize,
-        # so disable VTE's own text rewrapping to avoid flicker
-        # (lines briefly doubling from wrap before new content arrives).
-        if hasattr(terminal, 'vte') and terminal.vte:
-            terminal.vte.set_rewrap_on_resize(False)
         dbg('TmuxController: registered terminal for pane %s' % pane_id)
 
         # Replay any %output that arrived before registration
@@ -391,38 +372,40 @@ class TmuxController:
         """
         pane_id = self.terminal_to_pane.get(terminal, '?')
         # Ignore resizes before initial layout has been applied
-        if not self._layout_applied_time:
+        if not self.state.layout_applied_time:
             return
         dbg('notify_resize: %s %dx%d applying=%s' % (
-            pane_id, cols, rows, self._applying_layout))
+            pane_id, cols, rows, self.state.applying_layout))
         # Don't send resize while we're applying a layout from tmux.
         # Clear the flag reactively via _finish_applying_layout at
         # priority 210 — this runs after ALL pending notify_resize
         # callbacks (priority 200) have been suppressed.
-        if self._applying_layout:
+        if self.state.applying_layout:
             dbg('notify_resize: suppressed (applying_layout'
                 ' resize_pending=%s)' %
-                self._window_resize_pending)
-            if self.handlers and not self._window_resize_pending:
+                self.state.window_resize_pending)
+            if self.handlers and not self.state.window_resize_pending:
                 # Window has reached target size (or no resize
                 # was requested).  Reschedule on every suppressed
                 # call — defers clearing until after the LAST VTE
                 # settles, including anchor corrections from
                 # STALE paneds catching up to their real size.
                 from gi.repository import GLib
-                src = getattr(self, '_layout_clear_source',
-                              None)
+                src = self.state.layout_clear_source
                 if src:
                     GLib.source_remove(src)
-                tree = getattr(self.handlers,
-                               '_pending_layout_tree', None)
-                self._layout_clear_source = GLib.idle_add(
+                tree = self.state.pending_layout_tree
+                self.state.layout_clear_source = GLib.idle_add(
                     self._do_finish_applying_layout, tree,
                     priority=GLib.PRIORITY_DEFAULT_IDLE + 10)
-            if (self.handlers and
-                    self.handlers._initial_capture_pending):
-                self.handlers._check_pane_stable(
-                    pane_id, cols, rows)
+            # During handle drag, still report the dragged pane's
+            # size to tmux even while applying layout.  The
+            # detection requires _tmux_handle_pressed so only the
+            # actually-dragged handle is picked up.
+            for p in self.state.tmux_paneds:
+                if getattr(p, '_tmux_handle_pressed', False):
+                    self._send_split_bar_resize()
+                    break
             return
 
         def do_resize():
@@ -431,7 +414,7 @@ class TmuxController:
             def _snapshot_vte_sizes():
                 for t, pane_id in self.terminal_to_pane.items():
                     try:
-                        self._prev_vte_sizes[pane_id] = (
+                        self.state.prev_vte_sizes[pane_id] = (
                             t.vte.get_column_count(), t.vte.get_row_count())
                     except Exception:
                         pass
@@ -441,25 +424,25 @@ class TmuxController:
             for t in self.terminal_to_pane:
                 try:
                     top = t.get_toplevel()
-                    if self.handlers and self._last_chrome is not None:
+                    if self.handlers and self.state.last_chrome is not None:
                         chrome = self.handlers._get_chrome_size(top)
-                        if chrome != self._last_chrome:
-                            delta_w = chrome[0] - self._last_chrome[0]
-                            delta_h = chrome[1] - self._last_chrome[1]
+                        if chrome != self.state.last_chrome:
+                            delta_w = chrome[0] - self.state.last_chrome[0]
+                            delta_h = chrome[1] - self.state.last_chrome[1]
                             ws = top.get_size()
                             new_w = ws[0] + delta_w
                             new_h = ws[1] + delta_h
                             dbg('size_trace chrome_changed: '
                                 '%dx%d -> %dx%d delta=%dx%d '
                                 'resize=%dx%d' % (
-                                self._last_chrome[0],
-                                self._last_chrome[1],
+                                self.state.last_chrome[0],
+                                self.state.last_chrome[1],
                                 chrome[0], chrome[1],
                                 delta_w, delta_h,
                                 new_w, new_h))
                             top.resize(new_w, new_h)
-                            self._last_chrome = chrome
-                            self._layout_applied_time = \
+                            self.state.last_chrome = chrome
+                            self.state.layout_applied_time = \
                                 _time.monotonic()
                             _snapshot_vte_sizes()
                             return False
@@ -474,20 +457,20 @@ class TmuxController:
                 try:
                     top = t.get_toplevel()
                     px = top.get_size()
-                    if px != self._last_window_pixels:
-                        dbg('window pixels changed %s -> %s' % (self._last_window_pixels, px))
+                    if px != self.state.last_window_pixels:
+                        dbg('window pixels changed %s -> %s' % (self.state.last_window_pixels, px))
                         window_resized = True
-                        self._last_window_pixels = px
+                        self.state.last_window_pixels = px
                     # Check if we hit the tripwire boundary
                     # Tripwire is in allocation space (includes CSD)
                     alloc = top.get_allocation()
                     apx = (alloc.width, alloc.height)
-                    if (self._tripwire_armed and self._tripwire_pixels
+                    if (self.state.tripwire_armed and self.state.tripwire_pixels
                             and apx):
-                        hit_w = (self._tmux_max_cols is not None
-                                 and apx[0] >= self._tripwire_pixels[0])
-                        hit_h = (self._tmux_max_rows is not None
-                                 and apx[1] >= self._tripwire_pixels[1])
+                        hit_w = (self.state.tmux_max_cols is not None
+                                 and apx[0] >= self.state.tripwire_pixels[0])
+                        hit_h = (self.state.tmux_max_rows is not None
+                                 and apx[1] >= self.state.tripwire_pixels[1])
                         if hit_w or hit_h:
                             tripwire_hit = True
                     break
@@ -559,15 +542,15 @@ class TmuxController:
                 window_resized, len(self.terminal_to_pane)))
             if window_resized or len(self.terminal_to_pane) <= 1:
                 # Window resize: send refresh-client -C with total size
-                if not self._refresh_client_in_flight:
+                if not self.state.refresh_client_in_flight:
                     total_cols, total_rows = self._calculate_client_size()
                     if total_cols > 0 and total_rows > 0:
                         size = (total_cols, total_rows)
                         if tripwire_hit:
-                            self._pending_tripwire_hit = True
-                        if size != self._last_client_size:
-                            self._last_client_size = size
-                            self._refresh_client_in_flight = True
+                            self.state.pending_tripwire_hit = True
+                        if size != self.state.last_client_size:
+                            self.state.last_client_size = size
+                            self.state.begin_refresh()
                             dbg('sending refresh-client -C %d,%d'
                                 % (total_cols, total_rows))
                             self.protocol.send_command(
@@ -577,6 +560,11 @@ class TmuxController:
                                 callback=self._on_refresh_complete)
                 else:
                     dbg('notify_resize: skipped (refresh in flight)')
+            elif self.state.pending_new_paneds:
+                # New paneds being created (add-pane in progress) —
+                # don't send resize-pane; the layout will settle via
+                # new-paneds-allocated → _apply_ratios.
+                dbg('notify_resize: skipped (pending new paneds)')
             else:
                 # Split bar drag: send absolute resize for the most-changed pane
                 self._send_split_bar_resize()
@@ -586,25 +574,113 @@ class TmuxController:
 
         do_resize()
 
-        if self.handlers and self.handlers._initial_capture_pending:
+        if self.handlers and self.state.initial_capture_pending:
+            # Log paned ancestry for settling diagnostics
+            w = terminal.get_parent()
+            while w is not None:
+                if hasattr(w, 'get_position') and hasattr(w, 'get_length'):
+                    c2 = w.get_child2()
+                    c2a = c2.get_allocation() if c2 else None
+                    mgap = getattr(w, '_measured_gap', None)
+                    dbg('settle trace %s: paned=%s '
+                        'pos=%d len=%d mgap=%s c2=%s' % (
+                        pane_id, type(w).__name__,
+                        w.get_position(), w.get_length(),
+                        mgap,
+                        '%dx%d' % (c2a.width, c2a.height)
+                        if c2a else 'None'))
+                w = w.get_parent()
             self.handlers._check_pane_stable(pane_id, cols, rows)
 
     def _do_finish_applying_layout(self, tree):
-        """Clear _applying_layout after all VTE size-allocate callbacks.
+        """Clear applying_layout after all VTE size-allocate callbacks.
 
         Scheduled at priority DEFAULT_IDLE+10 (210) from notify_resize.
         Rescheduled on every suppressed notify_resize, so it only
         fires after the LAST VTE settles (including anchor cascades).
         """
-        self._layout_clear_source = None
+        self.state.layout_clear_source = None
+        if not self.state.applying_layout:
+            # Stale callback from a previous cycle — the flag
+            # was already cleared.  Don't re-apply ratios.
+            return False
+        if tree is None:
+            # Scheduled from a suppressed notify_resize before
+            # _update_pane_sizes ran (e.g. split_axis event
+            # draining).  _update_pane_sizes will take over.
+            return False
         if self.handlers:
             self.handlers._finish_applying_layout(tree)
         return False
 
+    def _on_layout_settled(self, state, tree):
+        """Handle 'layout-settled' signal from state object.
+
+        Clears refresh-client in-flight flag and processes any
+        deferred tripwire hit.  Runs synchronously during the
+        signal emission from finish_layout().
+        """
+        self.state.end_refresh()
+        self._process_tripwire()
+        # Recheck window size — it may have changed while
+        # applying_layout suppressed notify_resize.  Deferred
+        # because _finish_applying_layout still has work to do
+        # after emitting this signal (tree size check, snapshot).
+        GLib.idle_add(self._recheck_after_layout)
+
+    def _recheck_after_layout(self):
+        """Send refresh-client if window capacity differs from tree.
+
+        Derives the client size from window pixel dimensions and
+        chrome overhead — this is always correct and can't inflate
+        from stale VTE column counts.  Replaces the VTE-sum approach
+        that caused oscillation with server-initiated layouts.
+        """
+        if self.state.applying_layout:
+            return False
+        if self.state.refresh_client_in_flight:
+            return False
+        win_px = self.state.last_window_pixels
+        chrome = self.state.last_chrome
+        if not win_px or not chrome:
+            return False
+        # Get char dimensions from any registered terminal.
+        char_w = char_h = 0
+        for t in list(self.terminal_to_pane.keys())[:1]:
+            try:
+                char_w = t.vte.get_char_width()
+                char_h = t.vte.get_char_height()
+            except Exception:
+                pass
+        if char_w <= 0 or char_h <= 0:
+            return False
+        paned_w = win_px[0] - chrome[0]
+        paned_h = win_px[1] - chrome[1]
+        total_cols = paned_w // char_w
+        total_rows = paned_h // char_h
+        if total_cols > 0 and total_rows > 0:
+            prev = self.state.last_client_size
+            size = (total_cols, total_rows)
+            if prev and size != prev:
+                self.state.last_client_size = size
+                self.state.begin_refresh()
+                dbg('recheck: client size differs, '
+                    'refresh-client -C %d,%d '
+                    '(from %dx%d px, chrome %dx%d)' %
+                    (total_cols, total_rows,
+                     win_px[0], win_px[1],
+                     chrome[0], chrome[1]))
+                self.protocol.send_command(
+                    'refresh-client -C {},{}'.format(
+                        total_cols, total_rows))
+                self._refresh_layout_state(
+                    callback=self._on_refresh_complete)
+        return False
+
     def _ensure_configure_handler(self, window):
         """Connect configure-event handler once per window."""
-        if not self._configure_handler_id:
-            self._configure_handler_id = window.connect(
+        if not self.state.configure_handler_id:
+            self.state.configure_handler_id = window.connect(
                 'configure-event',
                 self._on_configure_event)
 
@@ -618,20 +694,23 @@ class TmuxController:
         """
         ws = window.get_size()
         wa = window.get_allocation()
-        if self._window_resize_pending:
-            self._window_resize_pending = False
-            self._last_window_pixels = ws
+        if self.state.window_resize_pending:
+            self.state.end_window_resize()
+            # Don't update last_window_pixels here — let
+            # notify_resize detect the size change and send
+            # refresh-client to tmux.  last_window_pixels is
+            # updated by _finish_applying_layout and do_resize.
             dbg('configure-event: resize complete, '
                 'size=%s alloc=%dx%d applying=%s' % (
                 ws, wa.width, wa.height,
-                self._applying_layout))
+                self.state.applying_layout))
         else:
             dbg('configure-event: unsolicited, '
                 'size=%s alloc=%dx%d applying=%s '
                 'last_px=%s' % (
                 ws, wa.width, wa.height,
-                self._applying_layout,
-                self._last_window_pixels))
+                self.state.applying_layout,
+                self.state.last_window_pixels))
         return False  # propagate
 
     def _do_arm_tripwire(self):
@@ -639,7 +718,7 @@ class TmuxController:
         when the user tries to grow past the current max.
         Only constrains axes that have a known limit; unconstrained
         axes get screen-max so the user can freely resize them."""
-        if (self._tmux_max_cols is None and self._tmux_max_rows is None) \
+        if (self.state.tmux_max_cols is None and self.state.tmux_max_rows is None) \
                 or not self.handlers:
             # No constraints — clear any stale MAX hint
             if self.handlers:
@@ -648,13 +727,13 @@ class TmuxController:
         # For constrained axes, probe +1 char beyond the limit.
         # For unconstrained axes, use current tree size (no limit).
         tree = None
-        for tree in self.handlers._layout_trees.values():
+        for tree in self.state.layout_trees.values():
             break
         if tree is None:
             return False
-        probe_cols = (self._tmux_max_cols + 1) if self._tmux_max_cols \
+        probe_cols = (self.state.tmux_max_cols + 1) if self.state.tmux_max_cols \
             else tree.width
-        probe_rows = (self._tmux_max_rows + 1) if self._tmux_max_rows \
+        probe_rows = (self.state.tmux_max_rows + 1) if self.state.tmux_max_rows \
             else tree.height
         info_next = self.handlers._chars_to_max_pixels(
             probe_cols, probe_rows)
@@ -663,30 +742,30 @@ class TmuxController:
         trip_w, trip_h = info_next[0], info_next[1]
         # For unconstrained axes, use a very large value so
         # the WM doesn't limit that axis and tripwire never fires.
-        max_w = trip_w if self._tmux_max_cols is not None else 32767
-        max_h = trip_h if self._tmux_max_rows is not None else 32767
+        max_w = trip_w if self.state.tmux_max_cols is not None else 32767
+        max_h = trip_h if self.state.tmux_max_rows is not None else 32767
         # _set_max_size_pixels adds CSD → allocation-space values
         hint_w, hint_h = self.handlers._set_max_size_pixels(max_w, max_h)
         dbg('arming tripwire: cols=%s rows=%s '
             'trip=%dx%d px (hint=%dx%d)' % (
-                self._tmux_max_cols or 'free',
-                self._tmux_max_rows or 'free',
+                self.state.tmux_max_cols or 'free',
+                self.state.tmux_max_rows or 'free',
                 max_w, max_h, hint_w, hint_h))
         # Store in allocation space to match get_allocation() comparison
-        self._tripwire_pixels = (hint_w, hint_h)
-        self._tripwire_armed = True
+        self.state.tripwire_pixels = (hint_w, hint_h)
+        self.state.tripwire_armed = True
         return False
 
     def _arm_tripwire_after_idle(self):
         """Arm the tripwire after 2s of idle (initial or rejection)."""
-        if self._tripwire_timer:
-            GLib.source_remove(self._tripwire_timer)
+        if self.state.tripwire_timer:
+            GLib.source_remove(self.state.tripwire_timer)
 
         def _arm():
-            self._tripwire_timer = None
+            self.state.tripwire_timer = None
             return self._do_arm_tripwire()
 
-        self._tripwire_timer = GLib.timeout_add(2000, _arm)
+        self.state.tripwire_timer = GLib.timeout_add(2000, _arm)
 
     def _send_split_bar_resize(self):
         """Send resize-pane for child1 of the dragged handle.
@@ -702,7 +781,7 @@ class TmuxController:
             try:
                 cur = (terminal.vte.get_column_count(),
                        terminal.vte.get_row_count())
-                prev = self._prev_vte_sizes.get(pane_id)
+                prev = self.state.prev_vte_sizes.get(pane_id)
                 if prev and cur != prev:
                     dbg('split drag delta: %s prev=%dx%d '
                         'cur=%dx%d' % (
@@ -711,10 +790,13 @@ class TmuxController:
             except Exception:
                 pass
 
-        # Find the dragged handle: position changed, length same
-        paneds = getattr(self.handlers, '_tmux_paneds', set())
+        # Find the dragged handle: must have _tmux_handle_pressed,
+        # position changed from synced, and length unchanged.
+        paneds = self.state.tmux_paneds
         dragged = None
         for paned in paneds:
+            if not getattr(paned, '_tmux_handle_pressed', False):
+                continue
             synced = getattr(paned, '_tmux_synced_pos', None)
             if synced is None:
                 continue
@@ -758,7 +840,7 @@ class TmuxController:
         except Exception:
             return
 
-        prev = self._prev_vte_sizes.get(child1_id)
+        prev = self.state.prev_vte_sizes.get(child1_id)
         if prev is None:
             return
 
@@ -780,7 +862,7 @@ class TmuxController:
         cmd = ' '.join(parts)
         dbg('split drag: %s (child1 of dragged handle)' % cmd)
         self.protocol.send_command(cmd)
-        self._layout_applied_time = _time.monotonic()
+        self.state.layout_applied_time = _time.monotonic()
         self._refresh_layout_state()
 
     def _refresh_layout_state(self, callback=None):
@@ -796,7 +878,7 @@ class TmuxController:
         At this point tmux has processed our refresh-client -C.
         If a %layout-change was emitted, on_layout_change already
         ran (reader thread processes sequentially) and set
-        _layout_change_pending before queuing _update_pane_sizes.
+        state.layout_change_pending before queuing _update_pane_sizes.
         """
         self.handlers.on_initial_list_windows(result)
         GLib.idle_add(self._on_refresh_round_trip_done)
@@ -807,16 +889,15 @@ class TmuxController:
         Checks state flags to decide whether to clear _in_flight
         now or let _finish_applying_layout do it later.
         """
-        if (self._applying_layout
-                or getattr(self.handlers,
-                           '_layout_change_pending', False)):
+        if (self.state.applying_layout
+                or self.state.layout_change_pending):
             # Layout application is in progress or about to start.
             # _finish_applying_layout will clear _in_flight.
             dbg('round_trip_done: deferring to layout application')
             return False
 
         # No layout change from our request — clear gate and recheck.
-        self._refresh_client_in_flight = False
+        self.state.end_refresh()
         self._process_tripwire()
         dbg('round_trip_done: cleared in_flight, rechecking')
 
@@ -834,10 +915,10 @@ class TmuxController:
 
     def _process_tripwire(self):
         """Process any tripwire hit that was deferred during in-flight."""
-        if self._pending_tripwire_hit:
-            self._pending_tripwire_hit = False
-            self._tripwire_armed = False
-            self._tripwire_pixels = None
+        if self.state.pending_tripwire_hit:
+            self.state.pending_tripwire_hit = False
+            self.state.tripwire_armed = False
+            self.state.tripwire_pixels = None
 
     def _pane_size_for_tmux(self, terminal):
         """Get the tmux pane size for a terminal. Returns exact VTE size."""
@@ -886,8 +967,8 @@ class TmuxController:
                 return 0, 0
 
         # Use layout tree to sum VTE sizes + 1 per tmux separator
-        if self.handlers and self.handlers._layout_trees:
-            for tree in self.handlers._layout_trees.values():
+        if self.handlers and self.state.layout_trees:
+            for tree in self.state.layout_trees.values():
                 cols, rows = self._sum_vte_sizes(tree)
                 if cols > 0 and rows > 0:
                     dbg('client size: %dx%d (from VTE grid + separators)' % (

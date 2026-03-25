@@ -1702,13 +1702,21 @@ class Terminal(Gtk.VBox):
     def on_vte_size_allocate(self, widget, allocation):
         self.titlebar.update_terminal_size(self.vte.get_column_count(),
                 self.vte.get_row_count())
+        # Keep snap grid current — VTE char metrics finalize after
+        # realization and the initial set_font() value may differ.
+        cw = self.vte.get_char_width()
+        ch = self.vte.get_char_height()
+        if cw > 0 and ch > 0:
+            from .paned import HPaned, VPaned
+            HPaned._char_snap = cw
+            VPaned._char_snap = ch
         if self.tmux_pane_id is not None and self._tmux_controller:
             # Tmux mode: set char-grid increment hints so the WM snaps
             # to character boundaries during resize.  Skip during
             # layout application — per-terminal hints set wrong BASE
             # values with splits, causing the WM to snap-shrink.
             window = self.get_toplevel()
-            if not self._tmux_controller._applying_layout:
+            if not self._tmux_controller.state.applying_layout:
                 window.set_tmux_geometry_hints(self)
             self._tmux_controller.notify_resize(self,
                 self.vte.get_column_count(), self.vte.get_row_count())
@@ -2056,20 +2064,20 @@ class Terminal(Gtk.VBox):
     def set_font(self, fontdesc):
         """Set the font we want in VTE"""
         self.vte.set_font(fontdesc)
+        # Keep snap values current — get_char_width()/get_char_height()
+        # can change after the VTE is realized (e.g. 9 → 10), and
+        # _snap_position must use the same grid as _apply_ratios.
+        char_w = self.vte.get_char_width()
+        char_h = self.vte.get_char_height()
+        if char_w > 0 and char_h > 0:
+            from .paned import HPaned, VPaned
+            HPaned._char_snap = char_w
+            VPaned._char_snap = char_h
         # Set paned separator size to exactly 1 character cell — matching
         # tmux's 1-char separators. Applied once via CSS on first font set.
         if not Terminal._paned_css_applied:
-            char_w = self.vte.get_char_width()
-            char_h = self.vte.get_char_height()
             if char_w > 0 and char_h > 0:
                 Terminal._paned_css_applied = True
-                # Use the larger dimension for handle-size (GTK only
-                # supports one value) and use CSS min-width/min-height
-                # on separators for per-direction sizing.
-                # Set snap values for paned position snapping
-                from .paned import HPaned, VPaned
-                HPaned._char_snap = char_w
-                VPaned._char_snap = char_h
                 css = (
                     'paned {{'
                     '  -GtkPaned-handle-size: {h};'
