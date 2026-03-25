@@ -21,6 +21,7 @@ Enjoy!
 
 
 ==========
+
 Started by Chris Jones <cmsj@tenshu.net> in 2007, maintained from 2014 to 2020 by Stephen Boddy, currently maintained by Matt Rose. Terminator has had contributions from countless others listed in the [AUTHORS](AUTHORS) file.
 
 ## Description
