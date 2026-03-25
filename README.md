@@ -1,7 +1,27 @@
-Terminator
+Tmuxinator - Terminator with Tmux support
 ==========
 
-Started by Chris Jones <cmsj@tenshu.net> in 2007, maintained from 2014 to 2020 by Stephen Boddy, currently maintained by Matt Rose. Terminator has had contributions from countless others listed in the [AUTHORS](AUTHORS) file
+This fork of terminator is mostly just a beta test of the tmux support others to be able to play with and try out. There are likely to be a very large number of bugs that range from annoying to showstopping.
+
+Things to know:
+
+You can start tmux with `terminator --tmux-new <session>` or `terminator --tmux-attach <session>` to create or attach to a local tmux session. --tmux-attach will also auto-select a session in the same maner as a normal `tmux attach`. This has howewver only been given basic testing so far.
+
+More importantly, you can also use terminator normally, ssh into a remote host, and then run `tmux -C` or `tmux -C attach` inside the terminal, and terminator will automatically detect this and connect to the session. You can optionally enable auto-minimize for these attached tmux control windows with a checkbox in the preferences -> global section.
+
+You should also set the global option "Unfocused terminal background color" to 90-95% to make it more visible which active pane you're looking at in tmux.
+
+Title bars and scroll bars are automatically switched into overlays when in tmux mode, and checkboxes to enable the same mode for non-tmux mode is avalible in the profile settings under the relevent tabs. The reason for this change is that tmux mode works best when everything falls nicely on a a character grid. This is probably a solvable problem down the road, but the added complexity of allowing variable width window chrome was more than i wanted to deal with at the moment.
+
+Window sizes should nicely follow tmux server direction, so you can use the normal `tmux` commands as you would expect. but there may still be bugs here or there. If you do find something broken that hasn't been reported already, feel free to make a ticket and preferably include the --debug output from a short session showing the problem occur.
+
+Enjoy!
+
+-Ken Sanislo
+
+
+==========
+Started by Chris Jones <cmsj@tenshu.net> in 2007, maintained from 2014 to 2020 by Stephen Boddy, currently maintained by Matt Rose. Terminator has had contributions from countless others listed in the [AUTHORS](AUTHORS) file.
 
 ## Description
 
